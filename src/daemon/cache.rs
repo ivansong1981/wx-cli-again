@@ -144,15 +144,67 @@ impl DbCache {
         final_path.with_file_name(name)
     }
 
+    /// message 分片停用 Online 的提示，每分片每进程只打一次，避免轮询刷屏。
+    fn log_online_disabled_once(rel_key: &str) {
+        use std::sync::{Mutex, OnceLock};
+        static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+        let set = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        let Ok(mut g) = set.lock() else {
+            return;
+        };
+        if g.insert(rel_key.to_string()) {
+            eprintln!(
+                "[cache] online 已停用 {}（message 分片走解密缓存，规避 shm 陈旧视图）",
+                rel_key
+            );
+        }
+    }
+
     /// 打开解密产物做 cheap 校验（sqlite_master），防止错 key 粘住 CacheHit。
+    ///
+    /// WAL 增量刚 apply 完时 tmp 文件可能处于瞬时半一致态，立即探测会偶发
+    /// 失败（历史事故：探测失败整轮退出 → 发射水位与 meta 脱节 → 采集卡死）。
+    /// 瞬时失败重试两次（100ms / 300ms），仍失败才判坏缓存。
     fn probe_decrypted_db(path: &Path) -> Result<()> {
-        let conn = Connection::open(path)
-            .with_context(|| format!("探测打开解密缓存失败: {}", path.display()))?;
-        let n: i64 = conn
-            .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
-            .context("解密缓存 sqlite_master 探测失败（密钥可能错误）")?;
-        let _ = n;
-        Ok(())
+        const RETRY_DELAYS_MS: [u64; 2] = [100, 300];
+        let mut attempt = 0usize;
+        loop {
+            let result = (|| -> Result<()> {
+                let conn = Connection::open(path)
+                    .with_context(|| format!("探测打开解密缓存失败: {}", path.display()))?;
+                let n: i64 = conn
+                    .query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+                    .context("解密缓存 sqlite_master 探测失败（密钥可能错误）")?;
+                let _ = n;
+                Ok(())
+            })();
+            match result {
+                Ok(()) => {
+                    if attempt > 0 {
+                        eprintln!(
+                            "[cache] 探测重试第 {} 次后成功: {}",
+                            attempt,
+                            path.display()
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    if attempt >= RETRY_DELAYS_MS.len() {
+                        return Err(e.context(format!("探测共重试 {} 次仍失败", attempt)));
+                    }
+                    eprintln!(
+                        "[cache] 探测第 {} 次失败，{}ms 后重试: {}: {:#}",
+                        attempt + 1,
+                        RETRY_DELAYS_MS[attempt],
+                        path.display(),
+                        e
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAYS_MS[attempt]));
+                    attempt += 1;
+                }
+            }
+        }
     }
 
     /// temp → final。Unix 上 rename 替换后旧 fd 仍指向旧 inode；Windows 先删目标。
@@ -306,6 +358,11 @@ impl DbCache {
     /// 查询用连接：优先 SQLCipher 在线打开加密源，失败再退回解密缓存。
     ///
     /// 大库（message_0/1）上 online 路径避免 10s+ 全量解密。
+    ///
+    /// **message/* 分片例外**：Online 直读加密源时 WAL 可见性依赖源进程持有
+    /// 的 shm 索引，checkpoint 停滞期会读到陈旧视图（漏 WAL 内新行，历史上
+    /// 造成采集卡死）。message/biz_message 分片一律走解密缓存路径——其新鲜度
+    /// 由 (db_mtime, wal_mtime) 双键判定，无此问题。
     pub async fn open_query_conn(&self, rel_key: &str) -> Result<Option<(Connection, CacheMode)>> {
         let Some(key_hex) = self.key_hex(rel_key) else {
             return Ok(None);
@@ -315,23 +372,31 @@ impl DbCache {
             return Ok(None);
         }
 
-        let src2 = src.clone();
-        let key2 = key_hex.clone();
-        let online = tokio::task::spawn_blocking(move || sqlcipher::open_encrypted_readonly(&src2, &key2))
+        let online_allowed =
+            !(super::is_msg_db_key(rel_key) || super::is_biz_msg_db_key(rel_key));
+        if online_allowed {
+            let src2 = src.clone();
+            let key2 = key_hex.clone();
+            let online = tokio::task::spawn_blocking(move || {
+                sqlcipher::open_encrypted_readonly(&src2, &key2)
+            })
             .await
             .context("online open task join failed")?;
 
-        match online {
-            Ok(conn) => {
-                // 不刷屏：仅在 debug 或首次可考虑日志；这里用安静路径
-                return Ok(Some((conn, CacheMode::Online)));
+            match online {
+                Ok(conn) => {
+                    // 不刷屏：仅在 debug 或首次可考虑日志；这里用安静路径
+                    return Ok(Some((conn, CacheMode::Online)));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[cache] online 打开失败 {}，回退解密缓存: {:#}",
+                        rel_key, e
+                    );
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "[cache] online 打开失败 {}，回退解密缓存: {:#}",
-                    rel_key, e
-                );
-            }
+        } else {
+            Self::log_online_disabled_once(rel_key);
         }
 
         let resolved = self.get_with_mode(rel_key).await?;

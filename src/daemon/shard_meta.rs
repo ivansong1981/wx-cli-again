@@ -81,6 +81,16 @@ pub fn save(meta: &ShardMetaFile) {
 }
 
 pub fn source_mtime_ns(path: &Path) -> u64 {
+    // WAL 感知口径：微信 checkpoint 停滞期主库 mtime 可能长时间冻结，
+    // 新消息只体现在 `-wal` 伴生文件的 mtime 上。取两者较大值作为
+    // "源新鲜度"，判定侧（may_overlap / missing 短路）与写入侧
+    // （record_open / missing 分支）共用本函数，口径天然一致。
+    let db_mt = file_mtime_ns(path);
+    let wal_mt = wal_sidecar_path(path).as_deref().map(file_mtime_ns).unwrap_or(0);
+    db_mt.max(wal_mt)
+}
+
+fn file_mtime_ns(path: &Path) -> u64 {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .map(|t| {
@@ -89,6 +99,12 @@ pub fn source_mtime_ns(path: &Path) -> u64 {
                 .unwrap_or(0)
         })
         .unwrap_or(0)
+}
+
+fn wal_sidecar_path(path: &Path) -> Option<PathBuf> {
+    let mut name = path.file_name()?.to_os_string();
+    name.push("-wal");
+    Some(path.with_file_name(name))
 }
 
 /// 判断分片是否可能与 [since, until] 时间窗重叠。

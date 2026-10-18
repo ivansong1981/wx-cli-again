@@ -416,7 +416,7 @@ pub async fn q_history(
     };
 
     // 按时间路由分片：避免为「最近 N 条」解密全部 message_*.db
-    let (shards, scanned) = find_msg_shards(db, names, &username, eff_since, eff_until).await?;
+    let (shards, scanned) = find_msg_shards(db, names, &username, eff_since, eff_until, false).await?;
     if shards.is_empty() {
         anyhow::bail!("找不到 {} 的消息记录", display);
     }
@@ -991,7 +991,7 @@ pub async fn q_search(
     if let Some(chat_names) = chats {
         for chat_name in &chat_names {
             if let Some(uname) = resolve_username(chat_name, names) {
-                let (shards, _) = find_msg_shards(db, names, &uname, None, None).await?;
+                let (shards, _) = find_msg_shards(db, names, &uname, None, None, false).await?;
                 for shard in shards {
                     scanned_rel_keys.insert(shard.rel_key.clone());
                     cache_modes
@@ -1291,12 +1291,20 @@ fn resolve_username(chat_name: &str, names: &Names) -> Option<String> {
 /// 1. 加密源 mtime 降序：优先热分片，避免先解密冷库
 /// 2. `shard-meta.json` **按表** 时间窗过滤：since/until 可跳过不重叠分片
 /// 3. 打开后写回 per-table min/max create_time + Timestamp 表
+///
+/// `bypass_meta_gate`：轮询（new-messages）路径传 true，跳过基于 meta 的
+/// may_overlap 窗口判定与 missing_tables 短路——meta 的 max_ts 是"上次打开时
+/// 读到的水位"，与发射水位（last_check）脱耦时两道闸会互相锁死（meta 不推进
+/// ⇒ 不打开 ⇒ meta 永不推进）。轮询路径本来就要为每个 changed 会话打开发射，
+/// 短路在此纯属多余；打开后用真实 MAX/MIN 的二次过滤仍然生效。meta 的
+/// record_open / missing 标记照常写回，供 history/search 路径继续使用。
 async fn find_msg_shards(
     db: &DbCache,
     names: &Names,
     username: &str,
     since: Option<i64>,
     until: Option<i64>,
+    bypass_meta_gate: bool,
 ) -> Result<(Vec<MessageShard>, usize)> {
     let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
     if !msg_table_re().is_match(&table_name) {
@@ -1316,18 +1324,20 @@ async fn find_msg_shards(
             .join(rel_key.replace('/', std::path::MAIN_SEPARATOR_STR));
         let src_mtime = super::shard_meta::source_mtime_ns(&src_path);
         let entry = meta_file.shards.get(rel_key);
-        if !super::shard_meta::may_overlap(entry, src_mtime, &table_name, since, until) {
-            continue;
-        }
-        if entry
-            .map(|e| e.missing_tables.iter().any(|t| t == &table_name))
-            .unwrap_or(false)
-            && entry
-                .map(|e| e.source_mtime_ns == src_mtime || e.source_mtime_ns == 0)
+        if !bypass_meta_gate {
+            if !super::shard_meta::may_overlap(entry, src_mtime, &table_name, since, until) {
+                continue;
+            }
+            if entry
+                .map(|e| e.missing_tables.iter().any(|t| t == &table_name))
                 .unwrap_or(false)
-        {
-            // 上次确认该 talker 表不在此分片，且源文件未变
-            continue;
+                && entry
+                    .map(|e| e.source_mtime_ns == src_mtime || e.source_mtime_ns == 0)
+                    .unwrap_or(false)
+            {
+                // 上次确认该 talker 表不在此分片，且源文件未变
+                continue;
+            }
         }
 
         let opened = match db.open_query_conn(rel_key).await? {
@@ -3515,7 +3525,7 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
     }
 
     // 降级路径：从消息记录中聚合发言过的成员（必须 open_query_conn，path 是加密源）
-    let (shards, _) = find_msg_shards(db, names, &username, None, None).await?;
+    let (shards, _) = find_msg_shards(db, names, &username, None, None, false).await?;
     if shards.is_empty() {
         return Ok(json!({
             "chat": display,
@@ -3685,7 +3695,7 @@ pub async fn q_new_messages(
             .unwrap_or(fallback_ts);
         // 用 since 做分片时间路由，跳过冷库
         let since_for_route = Some(since_ts.saturating_add(1));
-        let (shards, _) = find_msg_shards(db, names, uname, since_for_route, None).await?;
+        let (shards, _) = find_msg_shards(db, names, uname, since_for_route, None, true).await?;
         if shards.is_empty() {
             continue;
         }
@@ -3989,7 +3999,7 @@ pub async fn q_stats(
     let chat_type = chat_type_of(&username, names);
     let is_group = chat_type == "group";
 
-    let (shards, scanned) = find_msg_shards(db, names, &username, None, None).await?;
+    let (shards, scanned) = find_msg_shards(db, names, &username, None, None, false).await?;
     if shards.is_empty() {
         anyhow::bail!("找不到 {} 的消息记录", display);
     }
@@ -5063,7 +5073,7 @@ pub async fn q_attachments(
     let type_to_kind: HashMap<i64, AttachmentKind> =
         kind_filters.iter().map(|(k, t)| (*t, *k)).collect();
 
-    let (shards, scanned) = find_msg_shards(db, names, &username, None, None).await?;
+    let (shards, scanned) = find_msg_shards(db, names, &username, None, None, false).await?;
     if shards.is_empty() {
         anyhow::bail!("找不到 {} 的消息记录", display);
     }
