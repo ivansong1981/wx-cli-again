@@ -12,6 +12,14 @@ use crate::crypto::sqlcipher;
 use crate::crypto::wal;
 use rusqlite::Connection;
 
+/// 统一 cache 日志格式：`[cache] YYYY-MM-DD HH:MM:SS <msg>`。
+/// 多轮轮询日志交错时，行内时间戳是排查时序的关键锚点。
+macro_rules! clog {
+    ($($arg:tt)*) => {
+        eprintln!("[cache] {} {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"), format!($($arg)*))
+    };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MtimeEntry {
     db_mt: u64,
@@ -153,8 +161,8 @@ impl DbCache {
             return;
         };
         if g.insert(rel_key.to_string()) {
-            eprintln!(
-                "[cache] online 已停用 {}（message 分片走解密缓存，规避 shm 陈旧视图）",
+            clog!(
+                "online 已停用 {}（message 分片走解密缓存，规避 shm 陈旧视图）",
                 rel_key
             );
         }
@@ -181,11 +189,7 @@ impl DbCache {
             match result {
                 Ok(()) => {
                     if attempt > 0 {
-                        eprintln!(
-                            "[cache] 探测重试第 {} 次后成功: {}",
-                            attempt,
-                            path.display()
-                        );
+                        clog!("探测重试第 {} 次后成功: {}", attempt, path.display());
                     }
                     return Ok(());
                 }
@@ -193,8 +197,8 @@ impl DbCache {
                     if attempt >= RETRY_DELAYS_MS.len() {
                         return Err(e.context(format!("探测共重试 {} 次仍失败", attempt)));
                     }
-                    eprintln!(
-                        "[cache] 探测第 {} 次失败，{}ms 后重试: {}: {:#}",
+                    clog!(
+                        "探测第 {} 次失败，{}ms 后重试: {}: {:#}",
                         attempt + 1,
                         RETRY_DELAYS_MS[attempt],
                         path.display(),
@@ -389,10 +393,7 @@ impl DbCache {
                     return Ok(Some((conn, CacheMode::Online)));
                 }
                 Err(e) => {
-                    eprintln!(
-                        "[cache] online 打开失败 {}，回退解密缓存: {:#}",
-                        rel_key, e
-                    );
+                    clog!("online 打开失败 {}，回退解密缓存: {:#}", rel_key, e);
                 }
             }
         } else {
@@ -472,7 +473,7 @@ impl DbCache {
             }
         }
         if reused > 0 {
-            eprintln!("[cache] 复用 {} 个已解密 DB", reused);
+            clog!("复用 {} 个已解密 DB", reused);
         }
     }
 
@@ -615,8 +616,8 @@ impl DbCache {
                     Ok::<_, anyhow::Error>(())
                 })
                 .await??;
-                eprintln!(
-                    "[cache] WAL 增量 {} ({}ms)",
+                clog!(
+                    "WAL 增量 {} ({}ms)",
                     rel_key,
                     t0.elapsed().as_millis()
                 );
@@ -670,8 +671,8 @@ impl DbCache {
         })
         .await??;
 
-        eprintln!(
-            "[cache] 全量解密 {} ({}ms)",
+        clog!(
+            "全量解密 {} ({}ms)",
             rel_key,
             t0.elapsed().as_millis()
         );
