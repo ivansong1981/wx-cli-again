@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod meta;
+pub mod new_msg_cursor;
 pub mod query;
 pub mod server;
 pub mod shard_meta;

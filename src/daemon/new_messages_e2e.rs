@@ -10,13 +10,15 @@
 mod fixture;
 
 use super::cache::DbCache;
+use super::new_msg_cursor::BOUNDARY_RECHECK_POLLS;
 use super::query::{q_new_messages, Names};
+use crate::cli::new_messages::{cursor_from_response, parse_cursor, render_cursor};
 use fixture::{Fixture, ALICE, BOB, BOT, GROUP};
 use std::collections::HashMap;
 
 /// Polls with an unchanged `SessionTable` that still re-check the cursor
-/// second (plan v3, `BOUNDARY_RECHECK_POLLS`).
-const K: usize = 120;
+/// second.
+const K: usize = BOUNDARY_RECHECK_POLLS as usize;
 
 fn now_minus_hour() -> i64 {
     chrono::Utc::now().timestamp() - 3600
@@ -58,31 +60,31 @@ impl Poller {
     }
 
     /// One round from an explicit cursor text; returns (labels, new cursor).
+    /// The cursor goes through the CLI's own parse / render functions.
     async fn round_from(&self, cursor: Option<&str>) -> (Vec<String>, Option<String>) {
-        let state: Option<HashMap<String, i64>> = cursor.and_then(|text| {
-            let v: serde_json::Value = serde_json::from_str(text).ok()?;
-            Some(
-                v.get("sessions")?
-                    .as_object()?
-                    .iter()
-                    .filter_map(|(k, v)| v.as_i64().map(|ts| (k.clone(), ts)))
-                    .collect(),
-            )
-        });
-        let resp = q_new_messages(&self.db, &self.names, state, self.limit, true, false)
-            .await
-            .unwrap();
+        let parsed = cursor.map(parse_cursor).unwrap_or_default();
+        let resp = q_new_messages(
+            &self.db,
+            &self.names,
+            parsed.sessions,
+            parsed.boundary,
+            self.limit,
+            true,
+            false,
+        )
+        .await
+        .unwrap();
         let labels = resp["messages"]
             .as_array()
             .unwrap()
             .iter()
             .map(|m| label(m["content"].as_str().unwrap_or("")))
             .collect();
-        let new_state = resp["new_state"].as_object().cloned().unwrap_or_default();
-        let next = if new_state.is_empty() {
+        let (sessions, boundary) = cursor_from_response(&resp);
+        let next = if sessions.is_empty() {
             cursor.map(str::to_string)
         } else {
-            Some(serde_json::json!({ "sessions": new_state }).to_string())
+            Some(render_cursor(&sessions, &boundary))
         };
         (labels, next)
     }

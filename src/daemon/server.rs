@@ -236,11 +236,21 @@ async fn dispatch(req: Request, db: &DbCache, names: &tokio::sync::RwLock<Arc<Na
         },
         NewMessages {
             state,
+            boundary,
             limit,
             with_meta,
             debug_source,
         } => {
-            match query::q_new_messages(db, &names_arc, state, limit, with_meta, debug_source).await
+            match query::q_new_messages(
+                db,
+                &names_arc,
+                state,
+                boundary.unwrap_or_default(),
+                limit,
+                with_meta,
+                debug_source,
+            )
+            .await
             {
                 Ok(v) => Response::ok(v),
                 Err(e) => Response::err(e.to_string()),

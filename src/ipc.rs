@@ -80,6 +80,9 @@ pub enum Request {
         /// None 表示首次运行，会返回 new_state 供下次使用
         #[serde(skip_serializing_if = "Option::is_none")]
         state: Option<HashMap<String, i64>>,
+        /// 每个会话在游标那一秒已经返回过的消息（uubot #132）；缺省按旧规则
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boundary: Option<crate::daemon::new_msg_cursor::BoundaryMap>,
         #[serde(default = "default_limit_200")]
         limit: usize,
         #[serde(default, skip_serializing_if = "is_false")]
