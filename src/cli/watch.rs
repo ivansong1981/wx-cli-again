@@ -79,6 +79,7 @@ pub fn cmd_watch(interval_ms: u64, limit: usize, opts: OutputOpts) -> Result<()>
     if state.is_empty() {
         let resp = transport::send(Request::NewMessages {
             state: None,
+            boundary: None,
             limit,
             with_meta: false,
             debug_source: false,
@@ -103,6 +104,7 @@ pub fn cmd_watch(interval_ms: u64, limit: usize, opts: OutputOpts) -> Result<()>
 
         let resp = transport::send(Request::NewMessages {
             state: Some(state.clone()),
+            boundary: None,
             limit,
             with_meta: false,
             debug_source: false,

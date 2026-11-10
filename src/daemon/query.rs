@@ -9,6 +9,9 @@ use std::sync::{Arc, OnceLock};
 
 use super::cache::{CacheMode, DbCache};
 use super::meta::{derive_status, discover_unknown_shards, Meta};
+use super::new_msg_cursor::{
+    advance, applies, gate, message_id, route_since, where_clause, BoundaryMap, Gate,
+};
 
 /// 静态编译的 Msg 表名正则，避免在热路径中重复编译
 fn msg_table_re() -> &'static Regex {
@@ -3604,11 +3607,16 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
 }
 
 /// 查询新消息：以 session.db 的 last_timestamp 作为 inbox 索引，
-/// 只查询 last_timestamp > state[username] 的会话，精确且高效
+/// 只查询 last_timestamp > state[username] 的会话，精确且高效。
+///
+/// `boundary` 记着每个会话在游标那一秒已经返回过的消息；边界和游标对得上时，
+/// 游标那一秒会再查一次（同一秒晚到的消息，uubot #132），规则见
+/// `new_msg_cursor`。返回里多一个 `new_boundary`，由 CLI 和 `new_state` 一起存。
 pub async fn q_new_messages(
     db: &DbCache,
     names: &Names,
     state: Option<HashMap<String, i64>>,
+    boundary: BoundaryMap,
     limit: usize,
     with_meta: bool,
     debug_source: bool,
@@ -3637,29 +3645,48 @@ pub async fn q_new_messages(
     })
     .await??;
 
-    // 2. 记录 session.db 的当前快照（用于构建 new_state 基础）
-    let session_ts_map: HashMap<String, i64> = all_sessions
-        .iter()
-        .map(|(u, ts)| (u.clone(), *ts))
-        .collect();
+    let prev_ts = |uname: &str| state.as_ref().and_then(|m| m.get(uname)).copied();
 
-    // 3. 找出有新消息的会话
-    // 不在 state 中的会话（首次运行或新会话）以 fallback_ts 为基准
-    let changed: Vec<(String, i64)> = all_sessions
+    // 2-3. 每个会话这一轮查不查：last_timestamp 越过游标的照查；游标那一秒有边界、
+    //      还在复查窗口里的安静会话也查。不在 state 中的会话（首次运行或新会话）
+    //      以 fallback_ts 为基准。
+    let gates: Vec<(String, i64, Gate)> = all_sessions
         .into_iter()
-        .filter(|(uname, ts)| {
-            let last_known = state
-                .as_ref()
-                .and_then(|m| m.get(uname))
-                .copied()
-                .unwrap_or(fallback_ts);
-            *ts > last_known
+        .map(|(uname, ts)| {
+            let g = gate(ts, prev_ts(&uname), fallback_ts, boundary.get(&uname));
+            (uname, ts, g)
         })
         .collect();
+    let changed: Vec<&String> = gates
+        .iter()
+        .filter(|(_, _, g)| *g != Gate::Skip)
+        .map(|(uname, _, _)| uname)
+        .collect();
+
+    // 5. 重建 new_state / new_boundary（规则见 new_msg_cursor::advance）：
+    //    - 没查的会话：取 session.db 的 last_timestamp，但已知游标不回退；
+    //    - 查了、有消息返回：推进到返回的最大 timestamp，记下那一秒返回过的消息；
+    //    - 查了、没返回（被全局 limit 截断或还没可见）：后续调用保留旧游标，
+    //      首次调用 advance 到 session_ts，避免 since_ts 锁死在 fallback_ts。
+    let rebuild = |returned: &HashMap<String, Vec<(i64, String)>>| {
+        let mut new_state: HashMap<String, i64> = HashMap::new();
+        let mut new_boundary = BoundaryMap::new();
+        for (uname, session_ts, g) in &gates {
+            let rows = returned.get(uname).map(Vec::as_slice).unwrap_or(&[]);
+            let (next_ts, next_boundary) =
+                advance(*session_ts, prev_ts(uname), boundary.get(uname), *g, rows);
+            new_state.insert(uname.clone(), next_ts);
+            if let Some(b) = next_boundary {
+                new_boundary.insert(uname.clone(), b);
+            }
+        }
+        (new_state, new_boundary)
+    };
 
     let unknown_shards = current_unknown_shards(db, names);
 
     if changed.is_empty() {
+        let (new_state, new_boundary) = rebuild(&HashMap::new());
         let meta = meta_for_global_query(
             0,
             0,
@@ -3673,7 +3700,8 @@ pub async fn q_new_messages(
         return Ok(json!({
             "count": 0,
             "messages": [],
-            "new_state": session_ts_map,
+            "new_state": new_state,
+            "new_boundary": new_boundary,
             "meta": meta,
         }));
     }
@@ -3681,20 +3709,19 @@ pub async fn q_new_messages(
     // 4. 只查询有新消息的会话的消息表
     // per_table_limit 取 limit*5 防止单表截断，最终由全局 truncate 收尾
     let per_table_limit = limit.saturating_mul(5).max(200);
-    let mut all_msgs: Vec<Value> = Vec::new();
+    // 每条消息带着 (分片:local_id) 走到截断之后，用来算边界；输出前去掉。
+    let mut all_msgs: Vec<(Value, String)> = Vec::new();
     let mut scanned_rel_keys: HashSet<String> = HashSet::new();
     let mut hit_rel_keys: HashSet<String> = HashSet::new();
     let mut cache_modes: HashMap<String, String> = HashMap::new();
     let mut shard_paths: HashMap<String, String> = HashMap::new();
 
-    for (uname, _) in &changed {
-        let since_ts = state
-            .as_ref()
-            .and_then(|m| m.get(uname))
-            .copied()
-            .unwrap_or(fallback_ts);
-        // 用 since 做分片时间路由，跳过冷库
-        let since_for_route = Some(since_ts.saturating_add(1));
+    for uname in changed.iter().copied() {
+        let since_ts = prev_ts(uname).unwrap_or(fallback_ts);
+        let chat_boundary = boundary.get(uname);
+        let on_boundary = applies(prev_ts(uname), chat_boundary);
+        // 用 since 做分片时间路由，跳过冷库；边界生效时游标那一秒的分片也要读
+        let since_for_route = Some(route_since(since_ts, on_boundary));
         let (shards, _) = find_msg_shards(db, names, uname, since_for_route, None, true).await?;
         if shards.is_empty() {
             continue;
@@ -3726,20 +3753,26 @@ pub async fn q_new_messages(
             let group_nicknames2 = group_nicknames.clone();
             let tname_for_log = tname.clone();
             let rel_key_for_hit = shard.rel_key.clone();
+            let condition = where_clause(
+                on_boundary,
+                &chat_boundary
+                    .map(|b| b.local_ids_in(&rel))
+                    .unwrap_or_default(),
+            );
 
             let Some((conn, _)) = db.open_query_conn(&rel).await? else {
                 eprintln!("[new-messages] open failed for {}", rel);
                 continue;
             };
 
-            let msgs: Vec<Value> = match tokio::task::spawn_blocking(move || {
+            let msgs: Vec<(i64, Value)> = match tokio::task::spawn_blocking(move || {
                 let id2u = load_id2u(&conn);
 
                 let sql = format!(
                     "SELECT local_id, local_type, create_time, real_sender_id,
                             message_content, WCDB_CT_message_content
-                     FROM [{}] WHERE create_time > ? ORDER BY create_time ASC LIMIT ?",
-                    tname
+                     FROM [{}] WHERE {} ORDER BY create_time ASC, local_id ASC LIMIT ?2",
+                    tname, condition
                 );
                 let rows: Vec<_> = conn
                     .prepare(&sql)
@@ -3789,7 +3822,7 @@ pub async fn q_new_messages(
                     if let Some(u) = url {
                         msg["url"] = serde_json::Value::String(u);
                     }
-                    result.push(msg);
+                    result.push((local_id, msg));
                 }
                 Ok::<_, anyhow::Error>(result)
             })
@@ -3809,51 +3842,28 @@ pub async fn q_new_messages(
             if !msgs.is_empty() {
                 hit_rel_keys.insert(rel_key_for_hit);
             }
-            all_msgs.extend(msgs);
+            all_msgs.extend(
+                msgs.into_iter()
+                    .map(|(local_id, msg)| (msg, message_id(&rel, local_id))),
+            );
         }
     }
 
-    all_msgs.sort_by_key(|m| m["timestamp"].as_i64().unwrap_or(0));
+    all_msgs.sort_by_key(|(m, _)| m["timestamp"].as_i64().unwrap_or(0));
     all_msgs.truncate(limit);
 
-    // 5. 重建 new_state，防止全局 limit 截断导致消息永久丢失：
-    //    - 未变化的会话：沿用 session.db 的 last_timestamp（即 session_ts_map）
-    //    - 变化但全被截断（无消息在最终结果中）：
-    //        * 后续调用 (state=Some)：保留旧 since_ts，下次重试拿这部分消息
-    //        * 首次调用 (state=None)：advance 到 session_ts，避免 since_ts 锁死在
-    //          fallback_ts 导致后续每次都回扫 24h。窗口会随调用次数 + 时间累积扩大，
-    //          性能持续衰退。代价：首次 + 被截断会话的老消息看不到，需走 `wx history`。
-    //    - 变化且有消息返回：advance 到该会话在结果中的最大 timestamp（增量 fetch 标准语义）
-    let returned_max_ts: HashMap<String, i64> = {
-        let mut m: HashMap<String, i64> = HashMap::new();
-        for msg in &all_msgs {
-            if let (Some(u), Some(ts)) = (msg["username"].as_str(), msg["timestamp"].as_i64()) {
-                let e = m.entry(u.to_string()).or_insert(0);
-                if ts > *e {
-                    *e = ts;
-                }
-            }
+    // 截断之后实际返回的消息，按会话分组：(timestamp, 分片:local_id)
+    let mut returned: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    for (msg, id) in &all_msgs {
+        if let (Some(u), Some(ts)) = (msg["username"].as_str(), msg["timestamp"].as_i64()) {
+            returned
+                .entry(u.to_string())
+                .or_default()
+                .push((ts, id.clone()));
         }
-        m
-    };
-    let mut new_state = session_ts_map;
-    for (uname, _) in &changed {
-        let in_results = returned_max_ts.contains_key(uname);
-        let prev = state.as_ref().and_then(|m| m.get(uname)).copied();
-        let next_ts = match (in_results, prev) {
-            (true, _) => {
-                // 有消息返回：advance 到 returned_max；返回的最大 ts 通常 ≤ session_ts，
-                // 这样下次查 `since > returned_max` 仍能拿到 returned_max..session_ts 的截断尾巴。
-                returned_max_ts[uname]
-            }
-            (false, Some(prev)) => prev, // 后续 + 截断：保持旧 since
-            (false, None) => {
-                // 首次 + 截断：advance 到 session_ts 兜底，避免 since_ts 锁死。
-                new_state.get(uname).copied().unwrap_or(fallback_ts)
-            }
-        };
-        new_state.insert(uname.clone(), next_ts);
     }
+    let (new_state, new_boundary) = rebuild(&returned);
+    let all_msgs: Vec<Value> = all_msgs.into_iter().map(|(msg, _)| msg).collect();
 
     let meta = meta_for_global_query(
         scanned_rel_keys.len(),
@@ -3870,6 +3880,7 @@ pub async fn q_new_messages(
         "count": all_msgs.len(),
         "messages": all_msgs,
         "new_state": new_state,
+        "new_boundary": new_boundary,
         "meta": meta,
     }))
 }
