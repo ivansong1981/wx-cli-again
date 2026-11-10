@@ -4,6 +4,9 @@ pub mod query;
 pub mod server;
 pub mod shard_meta;
 
+#[cfg(test)]
+mod new_messages_e2e;
+
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;

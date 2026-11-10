@@ -148,6 +148,20 @@ pub fn cli_dir() -> PathBuf {
 }
 
 fn cli_home_dir() -> PathBuf {
+    // Unit tests never touch the real ~/.wx-cli (shard meta, cursor, caches):
+    // every test in the process shares one private scratch home.
+    #[cfg(test)]
+    {
+        static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        return TEST_HOME
+            .get_or_init(|| {
+                let home = std::env::temp_dir().join(format!("wx-cli-test-home-{}", std::process::id()));
+                let _ = std::fs::create_dir_all(&home);
+                home
+            })
+            .clone();
+    }
+    #[allow(unreachable_code)]
     resolve_cli_home(
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")),
         sudo_user_home_dir(),
