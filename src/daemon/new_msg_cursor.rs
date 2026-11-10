@@ -201,6 +201,9 @@ pub fn advance(
 mod tests {
     use super::*;
 
+    // Expected values are written out (120 polls, uubot #132 plan v3), not
+    // taken from BOUNDARY_RECHECK_POLLS, so a wrong window fails here.
+
     fn b(ts: i64, ids: &[&str], left: u32) -> Boundary {
         Boundary { ts, ids: ids.iter().map(|s| s.to_string()).collect(), left }
     }
@@ -249,11 +252,11 @@ mod tests {
         let prev = b(100, &["m:1"], 5);
         let (ts, nb) = advance(100, Some(100), Some(&prev), Gate::Recheck, &ret(&[(100, "m:2")]));
         assert_eq!(ts, 100);
-        assert_eq!(nb, Some(b(100, &["m:1", "m:2"], BOUNDARY_RECHECK_POLLS)));
+        assert_eq!(nb, Some(b(100, &["m:1", "m:2"], 120)));
 
         let (ts, nb) = advance(105, Some(100), Some(&prev), Gate::Changed, &ret(&[(100, "m:2"), (103, "m:3"), (103, "m:4")]));
         assert_eq!(ts, 103);
-        assert_eq!(nb, Some(b(103, &["m:3", "m:4"], BOUNDARY_RECHECK_POLLS)));
+        assert_eq!(nb, Some(b(103, &["m:3", "m:4"], 120)));
     }
 
     #[test]
@@ -291,7 +294,7 @@ mod tests {
         let parsed = parse_boundary(Some(&v));
         assert_eq!(parsed.keys().collect::<Vec<_>>(), vec!["ok", "too_many_left"]);
         assert_eq!(parsed["ok"].ids, vec!["message/message_0.db:1", "message/message_0.db:2"]);
-        assert_eq!(parsed["too_many_left"].left, BOUNDARY_RECHECK_POLLS);
+        assert_eq!(parsed["too_many_left"].left, 120);
         assert!(parse_boundary(Some(&serde_json::json!([1]))).is_empty());
         assert!(parse_boundary(None).is_empty());
     }

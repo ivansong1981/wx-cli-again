@@ -10,15 +10,15 @@
 mod fixture;
 
 use super::cache::DbCache;
-use super::new_msg_cursor::BOUNDARY_RECHECK_POLLS;
 use super::query::{q_new_messages, Names};
 use crate::cli::new_messages::{cursor_from_response, parse_cursor, render_cursor};
 use fixture::{Fixture, ALICE, BOB, BOT, GROUP};
 use std::collections::HashMap;
 
 /// Polls with an unchanged `SessionTable` that still re-check the cursor
-/// second.
-const K: usize = BOUNDARY_RECHECK_POLLS as usize;
+/// second: 120 (uubot #132 plan v3). Written out on purpose instead of
+/// taken from `BOUNDARY_RECHECK_POLLS`, so a wrong window fails these tests.
+const K: usize = 120;
 
 fn now_minus_hour() -> i64 {
     chrono::Utc::now().timestamp() - 3600
