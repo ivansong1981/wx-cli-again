@@ -2321,12 +2321,16 @@ fn appmsg_own_type(xml: &str) -> Option<String> {
         return xml_text(xml_child(appmsg, "type"))
             .or_else(|| xml_child(appmsg, "refermsg").map(|_| "57".to_string()));
     }
-    let outer = match (xml.find("<refermsg>"), xml.find("</refermsg>")) {
-        (Some(start), Some(end)) if start < end => {
-            format!("{}{}", &xml[..start], &xml[end + "</refermsg>".len()..])
-        }
-        _ => return extract_xml_text(xml, "type"),
+    let Some(start) = xml.find("<refermsg>") else {
+        return extract_xml_text(xml, "type");
     };
+    // Keep only what lies before the first <refermsg> and after the last
+    // </refermsg> that follows it; an unclosed block drops the rest.
+    let tail = xml[start..]
+        .rfind("</refermsg>")
+        .map(|end| &xml[start + end + "</refermsg>".len()..])
+        .unwrap_or("");
+    let outer = format!("{}{}", &xml[..start], tail);
     extract_xml_text(&outer, "type").or_else(|| Some("57".to_string()))
 }
 
@@ -2694,7 +2698,7 @@ fn extract_appmsg_url(text: &str) -> Option<String> {
     if !xml.contains("<appmsg") {
         return None;
     }
-    if extract_xml_text(&xml, "type").as_deref() == Some("57") {
+    if appmsg_own_type(&xml).as_deref() == Some("57") {
         return None;
     }
     let url = extract_xml_text(&xml, "url")
@@ -2794,6 +2798,20 @@ mod type_fields_tests {
         // Unparseable XML falls back to text search, with the quoted block skipped.
         let broken = r#"<msg><appmsg><title>t & u</title><refermsg><type>49</type></refermsg><type>57</type></appmsg></msg>"#;
         assert_eq!(appmsg_type_code(broken), Some(57));
+    }
+
+    #[test]
+    fn the_text_fallback_never_reads_a_type_inside_a_refermsg() {
+        // Unparseable XML (raw "&") with irregular refermsg blocks (kimi-r1-1).
+        for xml in [
+            r#"<msg><appmsg><title>t & u</title><refermsg><type>49</type><type>57</type></appmsg></msg>"#,
+            r#"<msg><appmsg><title>t & u</title></refermsg><refermsg><type>49</type></refermsg><type>57</type></appmsg></msg>"#,
+            r#"<msg><appmsg><title>t & u</title><refermsg><type>49</type></refermsg><refermsg><type>6</type></refermsg><type>57</type></appmsg></msg>"#,
+            r#"<msg><appmsg><title>t & u</title><refermsg><type>49</type><refermsg><type>6</type></refermsg><type>3</type></refermsg><type>57</type></appmsg></msg>"#,
+        ] {
+            assert_eq!(appmsg_type_code(xml), Some(57), "{xml}");
+            assert!(super::parse_appmsg(xml).unwrap().starts_with("[引用] t & u"), "{xml}");
+        }
     }
 
     #[test]
@@ -5880,6 +5898,19 @@ mod sns_tests {
             "<appmsg>",
             "<type>5</type>",
             "<url>weixin://bizmsgmenu?msgmenucontent=foo</url>",
+            "</appmsg>"
+        );
+        assert_eq!(extract_appmsg_url(xml), None);
+    }
+
+    #[test]
+    fn extract_appmsg_url_ignores_a_quote_whose_refermsg_comes_first() {
+        // kimi-r1-2: the quote's own type 57 comes after its refermsg.
+        let xml = concat!(
+            "<appmsg>",
+            "<refermsg><type>49</type></refermsg>",
+            "<type>57</type>",
+            "<url>https://example.com/quoted</url>",
             "</appmsg>"
         );
         assert_eq!(extract_appmsg_url(xml), None);
