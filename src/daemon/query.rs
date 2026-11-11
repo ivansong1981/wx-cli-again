@@ -2305,9 +2305,29 @@ pub fn appmsg_type_code(content: &str) -> Option<i64> {
     if !xml.contains("<appmsg") {
         return None;
     }
-    extract_xml_text(&xml, "type")
+    appmsg_own_type(&xml)
         .and_then(|s| s.trim().parse::<i64>().ok())
         .filter(|&n| n > 0)
+}
+
+/// The appmsg's own `<type>`, not the first `<type>` in the text: a quote's
+/// `<refermsg>` carries the quoted message's type, and some clients write it
+/// before the appmsg's own (uubot #86). A `<refermsg>` without an own type
+/// is a quote. Unparseable XML falls back to a text search that skips the
+/// first `<refermsg>` block.
+fn appmsg_own_type(xml: &str) -> Option<String> {
+    if let Ok(doc) = Document::parse(xml) {
+        let appmsg = doc.descendants().find(|node| node.has_tag_name("appmsg"))?;
+        return xml_text(xml_child(appmsg, "type"))
+            .or_else(|| xml_child(appmsg, "refermsg").map(|_| "57".to_string()));
+    }
+    let outer = match (xml.find("<refermsg>"), xml.find("</refermsg>")) {
+        (Some(start), Some(end)) if start < end => {
+            format!("{}{}", &xml[..start], &xml[end + "</refermsg>".len()..])
+        }
+        _ => return extract_xml_text(xml, "type"),
+    };
+    extract_xml_text(&outer, "type").or_else(|| Some("57".to_string()))
 }
 
 /// 写入 Agent 友好的类型字段（不覆盖已有 `type` 显示名）。
@@ -2406,7 +2426,7 @@ fn parse_appmsg_dom(text: &str) -> Option<String> {
 
 fn parse_appmsg_legacy(text: &str) -> Option<String> {
     let title = extract_xml_text(text, "title")?;
-    let atype = extract_xml_text(text, "type").unwrap_or_default();
+    let atype = appmsg_own_type(text).unwrap_or_default();
     match atype.as_str() {
         "6" => Some(if !title.is_empty() {
             format!("[文件] {}", title)
@@ -2734,6 +2754,46 @@ mod type_fields_tests {
         let xml = r#"<msg><appmsg><type>57</type><title>hi</title></appmsg></msg>"#;
         assert_eq!(appmsg_type_code(xml), Some(57));
         assert_eq!(appmsg_type_code("plain text"), None);
+    }
+
+    // uubot #86: some clients write the quoted message's <refermsg><type>
+    // before the appmsg's own <type>; the first <type> in the text is then 49.
+    const QUOTE_REFER_FIRST: &str = r#"<msg><appmsg appid="" sdkver="0"><title>@奥特曼 这个有解析吗？</title><des /><refermsg><type>49</type><svrid>1</svrid><displayname>奥特曼</displayname><content>&lt;msg&gt;&lt;appmsg&gt;&lt;title&gt;近五年(学生版).pdf&lt;/title&gt;&lt;type&gt;6&lt;/type&gt;&lt;/appmsg&gt;&lt;/msg&gt;</content></refermsg><type>57</type></appmsg></msg>"#;
+
+    #[test]
+    fn appmsg_type_reads_the_appmsg_own_type_not_the_quoted_one() {
+        assert_eq!(appmsg_type_code(QUOTE_REFER_FIRST), Some(57));
+        let mut msg = json!({});
+        attach_type_fields(&mut msg, 49, QUOTE_REFER_FIRST);
+        assert_eq!(msg["appmsg_type"], 57);
+    }
+
+    #[test]
+    fn a_quote_whose_refermsg_comes_first_still_renders_as_a_quote() {
+        assert_eq!(
+            super::parse_appmsg(QUOTE_REFER_FIRST).as_deref(),
+            Some("[引用] @奥特曼 这个有解析吗？\n  \u{21b3} 奥特曼: [文件] 近五年(学生版).pdf")
+        );
+    }
+
+    #[test]
+    fn a_quote_without_its_own_type_renders_as_a_quote() {
+        let xml = r#"<msg><appmsg><title>这个呢</title><refermsg><type>49</type><displayname>甲</displayname><content>&lt;msg&gt;&lt;appmsg&gt;&lt;title&gt;a.docx&lt;/title&gt;&lt;type&gt;6&lt;/type&gt;&lt;/appmsg&gt;&lt;/msg&gt;</content></refermsg></appmsg></msg>"#;
+        assert_eq!(appmsg_type_code(xml), Some(57));
+        assert_eq!(
+            super::parse_appmsg(xml).as_deref(),
+            Some("[引用] 这个呢\n  \u{21b3} 甲: [文件] a.docx")
+        );
+    }
+
+    #[test]
+    fn a_link_card_and_a_file_keep_their_own_type() {
+        let link = r#"<msg><appmsg><title>文章</title><type>5</type><url>https://example.com/a</url></appmsg></msg>"#;
+        assert_eq!(appmsg_type_code(link), Some(5));
+        assert_eq!(super::parse_appmsg(link).as_deref(), Some("[链接] 文章"));
+        // Unparseable XML falls back to text search, with the quoted block skipped.
+        let broken = r#"<msg><appmsg><title>t & u</title><refermsg><type>49</type></refermsg><type>57</type></appmsg></msg>"#;
+        assert_eq!(appmsg_type_code(broken), Some(57));
     }
 
     #[test]
