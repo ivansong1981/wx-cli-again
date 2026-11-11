@@ -2321,17 +2321,45 @@ fn appmsg_own_type(xml: &str) -> Option<String> {
         return xml_text(xml_child(appmsg, "type"))
             .or_else(|| xml_child(appmsg, "refermsg").map(|_| "57".to_string()));
     }
-    let Some(start) = xml.find("<refermsg>") else {
+    if !xml.contains("<refermsg>") {
         return extract_xml_text(xml, "type");
-    };
-    // Keep only what lies before the first <refermsg> and after the last
-    // </refermsg> that follows it; an unclosed block drops the rest.
-    let tail = xml[start..]
-        .rfind("</refermsg>")
-        .map(|end| &xml[start + end + "</refermsg>".len()..])
-        .unwrap_or("");
-    let outer = format!("{}{}", &xml[..start], tail);
-    extract_xml_text(&outer, "type").or_else(|| Some("57".to_string()))
+    }
+    extract_xml_text(&outside_refermsg(xml), "type").or_else(|| Some("57".to_string()))
+}
+
+/// The text outside every `<refermsg>` block, counting nesting; an unclosed
+/// block drops everything after its start, and a stray `</refermsg>` outside
+/// any block is dropped.
+fn outside_refermsg(xml: &str) -> String {
+    const OPEN: &str = "<refermsg>";
+    const CLOSE: &str = "</refermsg>";
+    let mut out = String::with_capacity(xml.len());
+    let mut depth = 0usize;
+    let mut rest = xml;
+    loop {
+        let next_open = rest.find(OPEN);
+        let next_close = rest.find(CLOSE);
+        let (at, is_open) = match (next_open, next_close) {
+            (Some(o), Some(c)) if o < c => (o, true),
+            (_, Some(c)) => (c, false),
+            (Some(o), None) => (o, true),
+            (None, None) => break,
+        };
+        if depth == 0 {
+            out.push_str(&rest[..at]);
+        }
+        if is_open {
+            depth += 1;
+            rest = &rest[at + OPEN.len()..];
+        } else {
+            depth = depth.saturating_sub(1);
+            rest = &rest[at + CLOSE.len()..];
+        }
+    }
+    if depth == 0 {
+        out.push_str(rest);
+    }
+    out
 }
 
 /// 写入 Agent 友好的类型字段（不覆盖已有 `type` 显示名）。
@@ -2808,6 +2836,10 @@ mod type_fields_tests {
             r#"<msg><appmsg><title>t & u</title></refermsg><refermsg><type>49</type></refermsg><type>57</type></appmsg></msg>"#,
             r#"<msg><appmsg><title>t & u</title><refermsg><type>49</type></refermsg><refermsg><type>6</type></refermsg><type>57</type></appmsg></msg>"#,
             r#"<msg><appmsg><title>t & u</title><refermsg><type>49</type><refermsg><type>6</type></refermsg><type>3</type></refermsg><type>57</type></appmsg></msg>"#,
+            // A closed block followed by an unclosed one (codex-r2-1, kimi-r2-1).
+            r#"<msg><appmsg><title>t & u</title><refermsg><type>49</type></refermsg><refermsg><type>6</type><type>57</type></appmsg></msg>"#,
+            // An unclosed outer block around a closed inner one (codex-r2-1).
+            r#"<msg><appmsg><title>t & u</title><refermsg><type>49</type><refermsg><type>6</type></refermsg><type>3</type><type>57</type></appmsg></msg>"#,
         ] {
             assert_eq!(appmsg_type_code(xml), Some(57), "{xml}");
             assert!(super::parse_appmsg(xml).unwrap().starts_with("[引用] t & u"), "{xml}");
