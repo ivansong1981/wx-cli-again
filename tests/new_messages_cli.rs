@@ -323,3 +323,32 @@ fn s157c_busy_window_at_the_upgrade_is_not_replayed() {
     assert!(r2.is_empty(), "replayed {} rows", r2.len());
     assert_eq!(r3, strs(&["after-upgrade"]));
 }
+
+// uubot #157 u2-r1 (kimi-u2-r1-1): the upgrade the mini actually makes. The
+// cursor is what uubot.4 wrote after returning the cursor-second row: a
+// boundary with its id, no window. Nothing old comes back; a row that
+// becomes visible late after the upgrade comes once; a new one comes next.
+#[test]
+fn s157d_late_row_after_an_upgrade_from_a_boundary_cursor() {
+    let t = now_minus_hour();
+    let mut c = Cli::new("s157d", 1, None);
+    c.fx.insert(0, None, t - 20, ALICE, "seen-before-upgrade");
+    let id = c.fx.post(0, t, BOT, "returned-by-old-core");
+    let old = json!({
+        "boundary": { GROUP: {
+            "ids": [format!("{}:{}", fixture::shard_key(0), id)], "left": 120, "ts": t } },
+        "sessions": { GROUP: t },
+    });
+    std::fs::write(c.cursor_path(), old.to_string()).unwrap();
+    let r1 = c.poll();
+    c.fx.insert(0, None, t - 3, ALICE, "late-after-upgrade");
+    let r2 = c.poll();
+    let r3 = c.poll();
+    c.fx.post(0, t + 2, BOB, "after-upgrade");
+    let r4 = c.poll();
+    c.finish();
+    assert!(r1.is_empty(), "{:?}", r1);
+    assert_eq!(r2, strs(&["late-after-upgrade"]));
+    assert!(r3.is_empty(), "{:?}", r3);
+    assert_eq!(r4, strs(&["after-upgrade"]));
+}
