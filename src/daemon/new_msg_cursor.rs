@@ -575,6 +575,21 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    // The seed read must not mark the cursor second's unreturned rows when
+    // the old rules still owe them: a global limit of 1 returns them one by one.
+    #[test]
+    fn setup_under_a_small_global_limit_still_returns_the_cursor_second() {
+        let visible = [(1000, "m:5"), (1000, "m:6"), (1000, "m:7"), (1000, "m:8")];
+        let mut state = (1000, Some(b(1000, &["m:5"], 3)));
+        let mut all = Vec::new();
+        for _ in 0..4 {
+            let (out, ts, nb) = poll(&visible, 1000, Some(state.0), state.1.as_ref(), 1);
+            all.extend(out);
+            state = (ts, nb);
+        }
+        assert_eq!(all, ret(&[(1000, "m:6"), (1000, "m:7"), (1000, "m:8")]));
+    }
+
     #[test]
     fn the_window_follows_the_cursor_and_forgets_older_ids() {
         let prev = bw(1000, 700, &[("m:1", 700), ("m:2", 900), ("m:3", 1000)], 9);
