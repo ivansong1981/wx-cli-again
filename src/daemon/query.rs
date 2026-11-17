@@ -3783,6 +3783,7 @@ pub async fn q_new_messages(
     //    - 窗口起点之后、只记成「已见过」的行（建窗口那一次）也进边界。
     let rebuild = |returned: &HashMap<String, Vec<(i64, String)>>,
                    marked: &HashMap<String, Vec<(i64, String)>>,
+                   incomplete: &HashSet<String>,
                    truncated: bool| {
         let mut new_state: HashMap<String, i64> = HashMap::new();
         let mut new_boundary = BoundaryMap::new();
@@ -3798,6 +3799,7 @@ pub async fn q_new_messages(
                 rows,
                 seen,
                 truncated,
+                incomplete.contains(uname),
             );
             new_state.insert(uname.clone(), next_ts);
             if let Some(b) = next_boundary {
@@ -3810,7 +3812,7 @@ pub async fn q_new_messages(
     let unknown_shards = current_unknown_shards(db, names);
 
     if changed.is_empty() {
-        let (new_state, new_boundary) = rebuild(&HashMap::new(), &HashMap::new(), false);
+        let (new_state, new_boundary) = rebuild(&HashMap::new(), &HashMap::new(), &HashSet::new(), false);
         let meta = meta_for_global_query(
             0,
             0,
@@ -3837,6 +3839,8 @@ pub async fn q_new_messages(
     let mut all_msgs: Vec<(Value, String)> = Vec::new();
     // 建窗口时窗口里已经可见、不返回的行：会话 → (create_time, 分片:local_id)
     let mut marked: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    // 有分片没读成的会话：这一轮的已见过不全，不建窗口（u1-r2 F3）
+    let mut incomplete: HashSet<String> = HashSet::new();
     let mut scanned_rel_keys: HashSet<String> = HashSet::new();
     let mut hit_rel_keys: HashSet<String> = HashSet::new();
     let mut cache_modes: HashMap<String, String> = HashMap::new();
@@ -3884,6 +3888,7 @@ pub async fn q_new_messages(
 
             let Some((conn, _)) = db.open_query_conn(&rel).await? else {
                 eprintln!("[new-messages] open failed for {}", rel);
+                incomplete.insert(uname.clone());
                 continue;
             };
 
@@ -3964,10 +3969,12 @@ pub async fn q_new_messages(
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     eprintln!("[new-messages] skip {}: {}", tname_for_log, e);
+                    incomplete.insert(uname.clone());
                     continue;
                 }
                 Err(e) => {
                     eprintln!("[new-messages] task error: {}", e);
+                    incomplete.insert(uname.clone());
                     continue;
                 }
             };
@@ -4000,7 +4007,7 @@ pub async fn q_new_messages(
                 .push((ts, id.clone()));
         }
     }
-    let (new_state, new_boundary) = rebuild(&returned, &marked, truncated);
+    let (new_state, new_boundary) = rebuild(&returned, &marked, &incomplete, truncated);
     let all_msgs: Vec<Value> = all_msgs.into_iter().map(|(msg, _)| msg).collect();
 
     let meta = meta_for_global_query(

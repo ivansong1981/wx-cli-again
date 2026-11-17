@@ -247,6 +247,24 @@ async fn legacy_cursor_does_not_replay_the_cursor_second() {
     assert!(p.poll().await.is_empty());
 }
 
+// uubot #157 u1-r2 F3: the window's seed read fails on one shard (a row
+// whose time is not an integer). The poll must not set up a window that
+// misses the rows already returned; later polls never replay them.
+#[tokio::test]
+async fn a_failed_seed_read_sets_no_window_and_replays_nothing() {
+    let t = now_minus_hour();
+    let mut p = Poller::new("s157f", 1, cursor_at(t)).await;
+    p.fx.insert(0, None, t - 20, ALICE, "returned-by-old-core-1");
+    p.fx.post(0, t, BOT, "returned-by-old-core-2");
+    p.fx.insert_real_time(0, (t - 10) as f64 + 0.5, BOB, "odd-time");
+    let r1 = p.poll().await;
+    let r2 = p.poll().await;
+    let r3 = p.poll().await;
+    assert!(r1.is_empty(), "{:?}", r1);
+    assert!(!r2.iter().any(|m| m.starts_with("returned-by-old-core")), "{:?}", r2);
+    assert!(!r3.iter().any(|m| m.starts_with("returned-by-old-core")), "{:?}", r3);
+}
+
 // 9. An unacknowledged poll is replayed from the same cursor text.
 #[tokio::test]
 async fn replaying_an_unacked_poll_gives_the_same_result() {

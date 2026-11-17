@@ -266,7 +266,10 @@ pub fn where_clause(read: &Read, excluded_local_ids: &[i64]) -> String {
 /// Next cursor second and boundary for one chat present in `SessionTable`.
 /// `returned` holds `(create_time, message_id)` of this chat's messages that
 /// survived the global limit; `marked` the ids of an `Init` read's seed
-/// query; `truncated` whether the global limit cut this poll.
+/// query; `truncated` whether the global limit cut this poll; `incomplete`
+/// whether a shard of this chat could not be read, so `marked` may miss
+/// rows and an `Init` read must not set a window up yet (u1-r2 F3).
+#[allow(clippy::too_many_arguments)]
 pub fn advance(
     session_ts: i64,
     prev_ts: Option<i64>,
@@ -276,6 +279,7 @@ pub fn advance(
     returned: &[(i64, String)],
     marked: &[(i64, String)],
     truncated: bool,
+    incomplete: bool,
 ) -> (i64, Option<Boundary>) {
     if gate == Gate::Skip {
         // Never move a known cursor back: SessionTable can lag behind the
@@ -293,6 +297,15 @@ pub fn advance(
         // start from the session's time.
         (None, None) => return (session_ts, None),
     };
+    if incomplete && matches!(read, Read::Init { .. }) {
+        // The main read follows the old rules, so advance by them: the
+        // cursor-second ids, no window; a later poll sets the window up.
+        let old = prev_boundary.filter(|b| prev_ts == Some(b.ts) && b.ts == next);
+        let mut ids: BTreeSet<String> = returned.iter().filter(|(t, _)| *t == next).map(|(_, id)| id.clone()).collect();
+        ids.extend(old.into_iter().flat_map(|b| b.ids.iter().cloned()));
+        let left = if returned.is_empty() { old.map_or(0, |b| b.left) } else { BOUNDARY_RECHECK_POLLS };
+        return (next, Some(Boundary { ts: next, ids: ids.into_iter().collect(), left, window: None }));
+    }
     let (mut from, mut seen, prev_left) = match (read, prev_boundary.and_then(|b| b.window.as_ref())) {
         (Read::Window { .. }, Some(w)) => (w.from, w.seen.clone(), prev_boundary.map_or(0, |b| b.left)),
         (Read::Init { from, cursor, old_ids }, _) => {
@@ -367,7 +380,7 @@ mod tests {
         let g = gate(session_ts, prev_ts, 0, prev);
         let read = plan(prev_ts, 0, prev);
         if g == Gate::Skip {
-            let (ts, nb) = advance(session_ts, prev_ts, prev, g, &read, &[], &[], false);
+            let (ts, nb) = advance(session_ts, prev_ts, prev, g, &read, &[], &[], false, false);
             return (Vec::new(), ts, nb);
         }
         let excluded = read.excluded_in(prev, "m");
@@ -399,7 +412,7 @@ mod tests {
         };
         let truncated = out.len() > limit;
         out.truncate(limit);
-        let (ts, nb) = advance(session_ts, prev_ts, prev, g, &read, &out, &marked, truncated);
+        let (ts, nb) = advance(session_ts, prev_ts, prev, g, &read, &out, &marked, truncated, false);
         (out, ts, nb)
     }
 
@@ -590,10 +603,27 @@ mod tests {
         assert_eq!(all, ret(&[(1000, "m:6"), (1000, "m:7"), (1000, "m:8")]));
     }
 
+    // u1-r2 F3: a shard that could not be read leaves the seed incomplete;
+    // the poll advances by the old rules and sets no window up.
+    #[test]
+    fn an_incomplete_setup_keeps_the_old_rules() {
+        let old = b(1000, &["m:5"], 4);
+        let read = plan(Some(1000), 0, Some(&old));
+        let (ts, nb) = advance(1000, Some(1000), Some(&old), Gate::Recheck, &read, &ret(&[(1000, "m:6")]), &[], false, true);
+        assert_eq!(ts, 1000);
+        assert_eq!(nb, Some(b(1000, &["m:5", "m:6"], 120)));
+        let (ts, nb) = advance(1003, Some(1000), Some(&old), Gate::Changed, &read, &[], &[], false, true);
+        assert_eq!((ts, nb), (1000, Some(old.clone())));
+        // A window read is not affected: unread rows stay unseen and come later.
+        let w = bw(1000, 700, &[("m:5", 1000)], 4);
+        let (_, nb) = advance(1000, Some(1000), Some(&w), Gate::Recheck, &Read::Window { from: 700 }, &[], &[], false, true);
+        assert!(nb.unwrap().window.is_some());
+    }
+
     #[test]
     fn the_window_follows_the_cursor_and_forgets_older_ids() {
         let prev = bw(1000, 700, &[("m:1", 700), ("m:2", 900), ("m:3", 1000)], 9);
-        let (ts, nb) = advance(1100, Some(1000), Some(&prev), Gate::Changed, &Read::Window { from: 700 }, &ret(&[(1100, "m:4")]), &[], false);
+        let (ts, nb) = advance(1100, Some(1000), Some(&prev), Gate::Changed, &Read::Window { from: 700 }, &ret(&[(1100, "m:4")]), &[], false, false);
         assert_eq!(ts, 1100);
         let nb = nb.unwrap();
         let w = nb.window.unwrap();
@@ -607,16 +637,16 @@ mod tests {
     fn rechecks_count_down_only_on_quiet_untruncated_polls() {
         let prev = bw(1000, 700, &[("m:3", 1000)], 2);
         let w = Read::Window { from: 700 };
-        let (_, nb) = advance(1000, Some(1000), Some(&prev), Gate::Recheck, &w, &[], &[], false);
+        let (_, nb) = advance(1000, Some(1000), Some(&prev), Gate::Recheck, &w, &[], &[], false, false);
         assert_eq!(nb.unwrap().left, 1);
         // Cut by the global limit (p1 F2): keep the count.
-        let (_, nb) = advance(1000, Some(1000), Some(&prev), Gate::Recheck, &w, &[], &[], true);
+        let (_, nb) = advance(1000, Some(1000), Some(&prev), Gate::Recheck, &w, &[], &[], true, false);
         assert_eq!(nb.unwrap().left, 2);
         // Read because the session moved (rows cut off or not visible yet).
-        let (ts, nb) = advance(1004, Some(1000), Some(&prev), Gate::Changed, &w, &[], &[], false);
+        let (ts, nb) = advance(1004, Some(1000), Some(&prev), Gate::Changed, &w, &[], &[], false, false);
         assert_eq!((ts, nb), (1000, Some(prev.clone())));
         // First run cut off by the global limit: start from the session time.
-        assert_eq!(advance(104, None, None, Gate::Changed, &Read::Strict { after: 0 }, &[], &[], true), (104, None));
+        assert_eq!(advance(104, None, None, Gate::Changed, &Read::Strict { after: 0 }, &[], &[], true, false), (104, None));
     }
 
     #[test]
@@ -640,12 +670,12 @@ mod tests {
     #[test]
     fn first_sight_keeps_the_strict_rule_from_the_fallback() {
         let read = Read::Strict { after: 500 };
-        let (ts, nb) = advance(900, None, None, Gate::Changed, &read, &ret(&[(600, "m:1"), (900, "m:2")]), &[], false);
+        let (ts, nb) = advance(900, None, None, Gate::Changed, &read, &ret(&[(600, "m:1"), (900, "m:2")]), &[], false, false);
         assert_eq!(ts, 900);
         let w = nb.unwrap().window.unwrap();
         assert_eq!(w.from, 600);
         assert_eq!(w.seen.len(), 2);
-        let (ts, nb) = advance(900, None, None, Gate::Changed, &Read::Strict { after: 800 }, &ret(&[(900, "m:2")]), &[], false);
+        let (ts, nb) = advance(900, None, None, Gate::Changed, &Read::Strict { after: 800 }, &ret(&[(900, "m:2")]), &[], false, false);
         assert_eq!(ts, 900);
         assert_eq!(nb.unwrap().window.unwrap().from, 801);
     }
@@ -654,9 +684,9 @@ mod tests {
     fn skipped_sessions_never_move_back_and_drop_stale_boundaries() {
         let prev = b(100, &["m:1"], 0);
         let r = Read::Init { from: 0, cursor: 100, old_ids: None };
-        assert_eq!(advance(99, Some(100), Some(&prev), Gate::Skip, &r, &[], &[], false), (100, Some(prev.clone())));
-        assert_eq!(advance(120, Some(100), Some(&prev), Gate::Skip, &r, &[], &[], false), (120, None));
-        assert_eq!(advance(90, None, None, Gate::Skip, &Read::Strict { after: 0 }, &[], &[], false), (90, None));
+        assert_eq!(advance(99, Some(100), Some(&prev), Gate::Skip, &r, &[], &[], false, false), (100, Some(prev.clone())));
+        assert_eq!(advance(120, Some(100), Some(&prev), Gate::Skip, &r, &[], &[], false, false), (120, None));
+        assert_eq!(advance(90, None, None, Gate::Skip, &Read::Strict { after: 0 }, &[], &[], false, false), (90, None));
     }
 
     #[test]
