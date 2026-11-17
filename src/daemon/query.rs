@@ -1309,12 +1309,28 @@ async fn find_msg_shards(
     until: Option<i64>,
     bypass_meta_gate: bool,
 ) -> Result<(Vec<MessageShard>, usize)> {
+    let (shards, scanned, _) =
+        find_msg_shards_checked(db, names, username, since, until, bypass_meta_gate).await?;
+    Ok((shards, scanned))
+}
+
+/// `find_msg_shards`, also counting the shards that could not be opened or
+/// checked: their rows are unknown this poll (uubot #157 u1-r3 F6).
+async fn find_msg_shards_checked(
+    db: &DbCache,
+    names: &Names,
+    username: &str,
+    since: Option<i64>,
+    until: Option<i64>,
+    bypass_meta_gate: bool,
+) -> Result<(Vec<MessageShard>, usize, usize)> {
     let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
     if !msg_table_re().is_match(&table_name) {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0));
     }
 
     let mut meta_file = super::shard_meta::load();
+    let mut failed = 0usize;
     let ordered = super::shard_meta::sort_rel_keys_by_mtime(db.db_dir(), &names.msg_db_keys);
 
     let mut scanned = 0usize;
@@ -1345,22 +1361,28 @@ async fn find_msg_shards(
 
         let opened = match db.open_query_conn(rel_key).await? {
             Some(v) => v,
-            None => continue,
+            None => {
+                failed += 1;
+                continue;
+            }
         };
         scanned += 1;
         let (conn, cache_mode) = opened;
         let tname = table_name.clone();
-        let stats: (bool, Option<i64>, Option<i64>, Option<i64>) =
+        let stats: (bool, Option<i64>, Option<i64>, Option<i64>, bool) =
             tokio::task::spawn_blocking(move || {
-                let table_exists: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                        [&tname],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .is_ok();
-                if !table_exists {
-                    return Ok::<_, anyhow::Error>((false, None, None, None));
+                let table_exists = conn.query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    [&tname],
+                    |row| row.get::<_, i64>(0),
+                );
+                match table_exists {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                        return Ok::<_, anyhow::Error>((false, None, None, None, false));
+                    }
+                    // Not known to be absent: skipped as before, but counted.
+                    Err(_) => return Ok((false, None, None, None, true)),
                 }
                 let max_ts: Option<i64> = conn
                     .query_row(
@@ -1383,11 +1405,15 @@ async fn find_msg_shards(
                         row.get(0)
                     })
                     .ok();
-                Ok((true, min_ts, max_ts, shard_start))
+                Ok((true, min_ts, max_ts, shard_start, false))
             })
             .await??;
 
-        let (exists, min_ts, max_ts, shard_start) = stats;
+        let (exists, min_ts, max_ts, shard_start, check_failed) = stats;
+        if check_failed {
+            failed += 1;
+            continue;
+        }
         if !exists {
             let e = meta_file.shards.entry(rel_key.clone()).or_default();
             if !e.missing_tables.iter().any(|t| t == &table_name) {
@@ -1438,7 +1464,7 @@ async fn find_msg_shards(
 
     // 按最大时间戳降序排列（最新的优先）
     results.sort_by_key(|s| std::cmp::Reverse(s.max_ts));
-    Ok((results, scanned))
+    Ok((results, scanned, failed))
 }
 
 #[allow(dead_code)] // tests still open by path
@@ -3851,7 +3877,11 @@ pub async fn q_new_messages(
         let chat_boundary = boundary.get(uname);
         // 用 since 做分片时间路由，跳过冷库；窗口起点之后的分片都要读
         let since_for_route = Some(read.route_since());
-        let (shards, _) = find_msg_shards(db, names, uname, since_for_route, None, true).await?;
+        let (shards, _, failed) =
+            find_msg_shards_checked(db, names, uname, since_for_route, None, true).await?;
+        if failed > 0 {
+            incomplete.insert(uname.clone());
+        }
         if shards.is_empty() {
             continue;
         }
@@ -3892,19 +3922,9 @@ pub async fn q_new_messages(
                 continue;
             };
 
-            let (msgs, seeded): (Vec<(i64, Value)>, Vec<(i64, i64)>) = match tokio::task::spawn_blocking(move || {
+            type Seeded = Option<rusqlite::Result<Vec<(i64, i64)>>>;
+            let (msgs, seeded): (Vec<(i64, Value)>, Seeded) = match tokio::task::spawn_blocking(move || {
                 let id2u = load_id2u(&conn);
-                let seeded: Vec<(i64, i64)> = match seed {
-                    Some((clause, from, cursor)) => conn
-                        .prepare(&format!("SELECT local_id, create_time FROM [{}] WHERE {}", tname, clause))
-                        .and_then(|mut stmt| {
-                            stmt.query_map(rusqlite::params![from, cursor], |row| {
-                                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-                            })
-                            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
-                        })?,
-                    None => Vec::new(),
-                };
 
                 let sql = format!(
                     "SELECT local_id, local_type, create_time, real_sender_id,
@@ -3962,6 +3982,16 @@ pub async fn q_new_messages(
                     }
                     result.push((local_id, msg));
                 }
+                // After the main read, so a failing seed never stops it (u1-r3 F5).
+                let seeded = seed.map(|(clause, from, cursor)| {
+                    conn.prepare(&format!("SELECT local_id, create_time FROM [{}] WHERE {}", tname, clause))
+                        .and_then(|mut stmt| {
+                            stmt.query_map(rusqlite::params![from, cursor], |row| {
+                                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                            })
+                            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
+                        })
+                });
                 Ok::<_, anyhow::Error>((result, seeded))
             })
             .await
@@ -3986,10 +4016,17 @@ pub async fn q_new_messages(
                 msgs.into_iter()
                     .map(|(local_id, msg)| (msg, message_id(&rel, local_id))),
             );
-            marked
-                .entry(uname.clone())
-                .or_default()
-                .extend(seeded.into_iter().map(|(local_id, ts)| (ts, message_id(&rel, local_id))));
+            match seeded {
+                Some(Ok(rows)) => marked
+                    .entry(uname.clone())
+                    .or_default()
+                    .extend(rows.into_iter().map(|(local_id, ts)| (ts, message_id(&rel, local_id)))),
+                Some(Err(e)) => {
+                    eprintln!("[new-messages] seed skipped {}: {}", rel, e);
+                    incomplete.insert(uname.clone());
+                }
+                None => {}
+            }
         }
     }
 

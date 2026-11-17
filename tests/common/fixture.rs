@@ -171,6 +171,18 @@ impl Fixture {
         .unwrap();
     }
 
+    /// Delete the rows whose label is `text` (a fault that goes away).
+    #[allow(dead_code)]
+    pub fn delete_text(&self, shard: usize, text: &str) {
+        Self::tick();
+        let conn = open_encrypted(&self.db_dir.join(shard_key(shard)));
+        conn.execute(
+            &format!("DELETE FROM [{}] WHERE message_content LIKE ?1", msg_table(GROUP)),
+            params![format!("%\n{}", text)],
+        )
+        .unwrap();
+    }
+
     /// Insert many same-time messages in one transaction (no per-row tick).
     pub fn insert_many(&self, shard: usize, ts: i64, sender: i64, texts: &[String]) {
         Self::tick();

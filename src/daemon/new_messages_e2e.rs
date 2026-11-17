@@ -265,6 +265,54 @@ async fn a_failed_seed_read_sets_no_window_and_replays_nothing() {
     assert!(!r3.iter().any(|m| m.starts_with("returned-by-old-core")), "{:?}", r3);
 }
 
+// u1-r3 F4: the faulty row goes away; the next poll sets the window up and
+// still replays nothing (the failed poll left the old rules as they were).
+#[tokio::test]
+async fn a_seed_fault_that_goes_away_replays_nothing() {
+    let t = now_minus_hour();
+    let mut p = Poller::new("s157g", 1, cursor_at(t)).await;
+    p.fx.insert(0, None, t - 20, ALICE, "old-1");
+    p.fx.post(0, t, BOT, "old-2");
+    p.fx.insert_real_time(0, (t - 10) as f64 + 0.5, BOB, "odd-time");
+    assert!(p.poll().await.is_empty());
+    p.fx.delete_text(0, "odd-time");
+    assert!(p.poll().await.is_empty());
+    assert!(p.poll().await.is_empty());
+}
+
+// u1-r3 F5: a seed read that keeps failing never stops the main read.
+#[tokio::test]
+async fn a_lasting_seed_fault_still_returns_new_messages() {
+    let t = now_minus_hour();
+    let mut p = Poller::new("s157h", 1, cursor_at(t)).await;
+    p.fx.post(0, t, BOT, "old");
+    p.fx.insert_real_time(0, (t - 10) as f64 + 0.5, BOB, "odd-time");
+    assert!(p.poll().await.is_empty());
+    p.fx.post(0, t + 1, ALICE, "new-after-fault");
+    assert_eq!(p.poll().await, strs(&["new-after-fault"]));
+    assert!(p.poll().await.is_empty());
+}
+
+// u1-r3 F6: the only shard cannot be opened while the window would be set
+// up, and is back on the next poll. Nothing old comes back.
+#[tokio::test]
+async fn a_shard_missing_at_setup_replays_nothing_when_back() {
+    let t = now_minus_hour();
+    let mut p = Poller::new("s157i", 1, cursor_at(t)).await;
+    p.fx.insert(0, None, t - 20, ALICE, "old-1");
+    p.fx.post(0, t, BOT, "old-2");
+    let shard = p.fx.db_dir.join(fixture::shard_key(0));
+    let aside = p.fx.root.join("aside.db");
+    std::fs::rename(&shard, &aside).unwrap();
+    let r1 = p.poll().await;
+    std::fs::rename(&aside, &shard).unwrap();
+    let r2 = p.poll().await;
+    let r3 = p.poll().await;
+    assert!(r1.is_empty(), "{:?}", r1);
+    assert!(r2.is_empty(), "{:?}", r2);
+    assert!(r3.is_empty(), "{:?}", r3);
+}
+
 // 9. An unacknowledged poll is replayed from the same cursor text.
 #[tokio::test]
 async fn replaying_an_unacked_poll_gives_the_same_result() {

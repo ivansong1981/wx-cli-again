@@ -288,6 +288,14 @@ pub fn advance(
         let kept = prev_boundary.filter(|b| b.ts == next).cloned();
         return (next, kept);
     }
+    if incomplete && matches!(read, Read::Init { .. }) {
+        // The main read follows the old rules, so advance exactly as the old
+        // core did (u1-r3 F4); a later poll sets the window up. A Setup read
+        // is a read the old core would not have made: count it as Changed.
+        let old_gate = if gate == Gate::Setup { Gate::Changed } else { gate };
+        let old = prev_boundary.map(|b| Boundary { window: None, ..b.clone() });
+        return advance_old_rules(session_ts, prev_ts, old.as_ref(), old_gate, returned);
+    }
     let newest = returned.iter().map(|(ts, _)| *ts).max();
     let next = match (prev_ts, newest) {
         (Some(p), Some(m)) => p.max(m),
@@ -297,15 +305,6 @@ pub fn advance(
         // start from the session's time.
         (None, None) => return (session_ts, None),
     };
-    if incomplete && matches!(read, Read::Init { .. }) {
-        // The main read follows the old rules, so advance by them: the
-        // cursor-second ids, no window; a later poll sets the window up.
-        let old = prev_boundary.filter(|b| prev_ts == Some(b.ts) && b.ts == next);
-        let mut ids: BTreeSet<String> = returned.iter().filter(|(t, _)| *t == next).map(|(_, id)| id.clone()).collect();
-        ids.extend(old.into_iter().flat_map(|b| b.ids.iter().cloned()));
-        let left = if returned.is_empty() { old.map_or(0, |b| b.left) } else { BOUNDARY_RECHECK_POLLS };
-        return (next, Some(Boundary { ts: next, ids: ids.into_iter().collect(), left, window: None }));
-    }
     let (mut from, mut seen, prev_left) = match (read, prev_boundary.and_then(|b| b.window.as_ref())) {
         (Read::Window { .. }, Some(w)) => (w.from, w.seen.clone(), prev_boundary.map_or(0, |b| b.left)),
         (Read::Init { from, cursor, old_ids }, _) => {
@@ -332,6 +331,47 @@ pub fn advance(
     };
     let ids: Vec<String> = seen.iter().filter(|(_, t)| **t == next).map(|(id, _)| id.clone()).collect();
     (next, Some(Boundary { ts: next, ids, left, window: Some(Window { from, seen }) }))
+}
+
+/// `advance` of `uubot.4`, unchanged: the cursor-second rules without a
+/// window. Used for a setup poll whose seed is incomplete.
+fn advance_old_rules(
+    session_ts: i64,
+    prev_ts: Option<i64>,
+    prev_boundary: Option<&Boundary>,
+    gate: Gate,
+    returned: &[(i64, String)],
+) -> (i64, Option<Boundary>) {
+    if gate == Gate::Skip {
+        let next = prev_ts.map_or(session_ts, |ts| ts.max(session_ts));
+        let kept = prev_boundary.filter(|b| b.ts == next).cloned();
+        return (next, kept);
+    }
+    if let Some(max_ts) = returned.iter().map(|(ts, _)| *ts).max() {
+        let mut ids: BTreeSet<String> = returned
+            .iter()
+            .filter(|(ts, _)| *ts == max_ts)
+            .map(|(_, id)| id.clone())
+            .collect();
+        if applies(prev_ts, prev_boundary) && prev_ts == Some(max_ts) {
+            ids.extend(prev_boundary.into_iter().flat_map(|b| b.ids.iter().cloned()));
+        }
+        let ids = ids.into_iter().collect();
+        return (max_ts, Some(Boundary { ts: max_ts, ids, left: BOUNDARY_RECHECK_POLLS, window: None }));
+    }
+    match prev_ts {
+        Some(ts) => {
+            let kept = prev_boundary.filter(|b| b.ts == ts).map(|b| {
+                let mut b = b.clone();
+                if gate == Gate::Recheck {
+                    b.left = b.left.saturating_sub(1);
+                }
+                b
+            });
+            (ts, kept)
+        }
+        None => (session_ts, None),
+    }
 }
 
 #[cfg(test)]
@@ -614,6 +654,13 @@ mod tests {
         assert_eq!(nb, Some(b(1000, &["m:5", "m:6"], 120)));
         let (ts, nb) = advance(1003, Some(1000), Some(&old), Gate::Changed, &read, &[], &[], false, true);
         assert_eq!((ts, nb), (1000, Some(old.clone())));
+        // No old boundary and nothing returned: no boundary, as the old core
+        // (u1-r3 F4: an empty one would turn the strict rule into `>=`).
+        let strict = plan(Some(1000), 0, None);
+        assert_eq!(advance(1000, Some(1000), None, Gate::Setup, &strict, &[], &[], false, true), (1000, None));
+        // A quiet Recheck counts down, as the old core.
+        let (_, nb) = advance(1000, Some(1000), Some(&old), Gate::Recheck, &read, &[], &[], false, true);
+        assert_eq!(nb.unwrap().left, 3);
         // A window read is not affected: unread rows stay unseen and come later.
         let w = bw(1000, 700, &[("m:5", 1000)], 4);
         let (_, nb) = advance(1000, Some(1000), Some(&w), Gate::Recheck, &Read::Window { from: 700 }, &[], &[], false, true);
