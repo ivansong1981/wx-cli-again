@@ -122,7 +122,7 @@ mod tests {
         let mut boundary = BoundaryMap::new();
         boundary.insert(
             "g@chatroom".to_string(),
-            Boundary { ts: 100, ids: vec!["message/message_0.db:3".to_string()], left: 7 },
+            Boundary { ts: 100, ids: vec!["message/message_0.db:3".to_string()], left: 7, window: None },
         );
         let text = render_cursor(&sessions, &boundary);
         assert_eq!(parse_cursor(&text), Cursor { sessions: Some(sessions.clone()), boundary });
@@ -144,6 +144,7 @@ mod tests {
                     ts: 1_794_000_000 + i as i64,
                     ids: vec![format!("message/message_{}.db:{}", i % 4, 100_000 + i)],
                     left: 120,
+                    window: None,
                 },
             );
         }
