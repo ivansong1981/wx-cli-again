@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use super::cache::{CacheMode, DbCache};
 use super::meta::{derive_status, discover_unknown_shards, Meta};
 use super::new_msg_cursor::{
-    advance, applies, gate, message_id, route_since, where_clause, BoundaryMap, Gate,
+    advance, gate, message_id, plan, where_clause, BoundaryMap, Gate, Read,
 };
 
 /// 静态编译的 Msg 表名正则，避免在热路径中重复编译
@@ -1309,12 +1309,61 @@ async fn find_msg_shards(
     until: Option<i64>,
     bypass_meta_gate: bool,
 ) -> Result<(Vec<MessageShard>, usize)> {
+    let (shards, scanned, _) =
+        find_msg_shards_checked(db, names, username, since, until, bypass_meta_gate).await?;
+    Ok((shards, scanned))
+}
+
+/// What the `sqlite_master` lookup of a shard's chat table says.
+#[derive(Debug, PartialEq, Eq)]
+enum TableCheck {
+    Exists,
+    Absent,
+    /// The lookup itself failed: the table may be there (u1-r3 F6).
+    Failed,
+}
+
+fn table_check(lookup: &rusqlite::Result<i64>) -> TableCheck {
+    match lookup {
+        Ok(_) => TableCheck::Exists,
+        Err(rusqlite::Error::QueryReturnedNoRows) => TableCheck::Absent,
+        Err(_) => TableCheck::Failed,
+    }
+}
+
+#[cfg(test)]
+mod table_check_tests {
+    use super::*;
+
+    // u1-r4 F7: only "no such row" means the table is absent; any other
+    // error is a failed check, which makes the chat's setup incomplete.
+    #[test]
+    fn only_no_rows_means_absent() {
+        assert_eq!(table_check(&Ok(1)), TableCheck::Exists);
+        assert_eq!(table_check(&Err(rusqlite::Error::QueryReturnedNoRows)), TableCheck::Absent);
+        let busy = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(5), Some("database is locked".into()));
+        assert_eq!(table_check(&Err(busy)), TableCheck::Failed);
+        assert_eq!(table_check(&Err(rusqlite::Error::InvalidQuery)), TableCheck::Failed);
+    }
+}
+
+/// `find_msg_shards`, also counting the shards that could not be opened or
+/// checked: their rows are unknown this poll (uubot #157 u1-r3 F6).
+async fn find_msg_shards_checked(
+    db: &DbCache,
+    names: &Names,
+    username: &str,
+    since: Option<i64>,
+    until: Option<i64>,
+    bypass_meta_gate: bool,
+) -> Result<(Vec<MessageShard>, usize, usize)> {
     let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
     if !msg_table_re().is_match(&table_name) {
-        return Ok((Vec::new(), 0));
+        return Ok((Vec::new(), 0, 0));
     }
 
     let mut meta_file = super::shard_meta::load();
+    let mut failed = 0usize;
     let ordered = super::shard_meta::sort_rel_keys_by_mtime(db.db_dir(), &names.msg_db_keys);
 
     let mut scanned = 0usize;
@@ -1345,22 +1394,28 @@ async fn find_msg_shards(
 
         let opened = match db.open_query_conn(rel_key).await? {
             Some(v) => v,
-            None => continue,
+            None => {
+                failed += 1;
+                continue;
+            }
         };
         scanned += 1;
         let (conn, cache_mode) = opened;
         let tname = table_name.clone();
-        let stats: (bool, Option<i64>, Option<i64>, Option<i64>) =
+        let stats: (bool, Option<i64>, Option<i64>, Option<i64>, bool) =
             tokio::task::spawn_blocking(move || {
-                let table_exists: bool = conn
-                    .query_row(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                        [&tname],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .is_ok();
-                if !table_exists {
-                    return Ok::<_, anyhow::Error>((false, None, None, None));
+                let table_exists = conn.query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                    [&tname],
+                    |row| row.get::<_, i64>(0),
+                );
+                match table_check(&table_exists) {
+                    TableCheck::Exists => {}
+                    TableCheck::Absent => {
+                        return Ok::<_, anyhow::Error>((false, None, None, None, false));
+                    }
+                    // Not known to be absent: skipped as before, but counted.
+                    TableCheck::Failed => return Ok((false, None, None, None, true)),
                 }
                 let max_ts: Option<i64> = conn
                     .query_row(
@@ -1383,11 +1438,15 @@ async fn find_msg_shards(
                         row.get(0)
                     })
                     .ok();
-                Ok((true, min_ts, max_ts, shard_start))
+                Ok((true, min_ts, max_ts, shard_start, false))
             })
             .await??;
 
-        let (exists, min_ts, max_ts, shard_start) = stats;
+        let (exists, min_ts, max_ts, shard_start, check_failed) = stats;
+        if check_failed {
+            failed += 1;
+            continue;
+        }
         if !exists {
             let e = meta_file.shards.entry(rel_key.clone()).or_default();
             if !e.missing_tables.iter().any(|t| t == &table_name) {
@@ -1438,7 +1497,7 @@ async fn find_msg_shards(
 
     // 按最大时间戳降序排列（最新的优先）
     results.sort_by_key(|s| std::cmp::Reverse(s.max_ts));
-    Ok((results, scanned))
+    Ok((results, scanned, failed))
 }
 
 #[allow(dead_code)] // tests still open by path
@@ -3719,9 +3778,10 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
 /// 查询新消息：以 session.db 的 last_timestamp 作为 inbox 索引，
 /// 只查询 last_timestamp > state[username] 的会话，精确且高效。
 ///
-/// `boundary` 记着每个会话在游标那一秒已经返回过的消息；边界和游标对得上时，
-/// 游标那一秒会再查一次（同一秒晚到的消息，uubot #132），规则见
-/// `new_msg_cursor`。返回里多一个 `new_boundary`，由 CLI 和 `new_state` 一起存。
+/// `boundary` 记着每个会话最近 `WINDOW_SECONDS` 里已经返回过的消息；窗口和
+/// 游标对得上时，从窗口起点再查一次，晚到的消息只返回一次（uubot #132、
+/// #157），规则见 `new_msg_cursor`。返回里多一个 `new_boundary`，由 CLI 和
+/// `new_state` 一起存。
 pub async fn q_new_messages(
     db: &DbCache,
     names: &Names,
@@ -3760,17 +3820,18 @@ pub async fn q_new_messages(
     // 2-3. 每个会话这一轮查不查：last_timestamp 越过游标的照查；游标那一秒有边界、
     //      还在复查窗口里的安静会话也查。不在 state 中的会话（首次运行或新会话）
     //      以 fallback_ts 为基准。
-    let gates: Vec<(String, i64, Gate)> = all_sessions
+    let gates: Vec<(String, i64, Gate, Read)> = all_sessions
         .into_iter()
         .map(|(uname, ts)| {
             let g = gate(ts, prev_ts(&uname), fallback_ts, boundary.get(&uname));
-            (uname, ts, g)
+            let read = plan(prev_ts(&uname), fallback_ts, boundary.get(&uname));
+            (uname, ts, g, read)
         })
         .collect();
-    let changed: Vec<&String> = gates
+    let changed: Vec<(&String, &Read)> = gates
         .iter()
-        .filter(|(_, _, g)| *g != Gate::Skip)
-        .map(|(uname, _, _)| uname)
+        .filter(|(_, _, g, _)| *g != Gate::Skip)
+        .map(|(uname, _, _, read)| (uname, read))
         .collect();
 
     // 5. 重建 new_state / new_boundary（规则见 new_msg_cursor::advance）：
@@ -3778,13 +3839,27 @@ pub async fn q_new_messages(
     //    - 查了、有消息返回：推进到返回的最大 timestamp，记下那一秒返回过的消息；
     //    - 查了、没返回（被全局 limit 截断或还没可见）：后续调用保留旧游标，
     //      首次调用 advance 到 session_ts，避免 since_ts 锁死在 fallback_ts。
-    let rebuild = |returned: &HashMap<String, Vec<(i64, String)>>| {
+    //    - 窗口起点之后、只记成「已见过」的行（建窗口那一次）也进边界。
+    let rebuild = |returned: &HashMap<String, Vec<(i64, String)>>,
+                   marked: &HashMap<String, Vec<(i64, String)>>,
+                   incomplete: &HashSet<String>,
+                   truncated: bool| {
         let mut new_state: HashMap<String, i64> = HashMap::new();
         let mut new_boundary = BoundaryMap::new();
-        for (uname, session_ts, g) in &gates {
+        for (uname, session_ts, g, read) in &gates {
             let rows = returned.get(uname).map(Vec::as_slice).unwrap_or(&[]);
-            let (next_ts, next_boundary) =
-                advance(*session_ts, prev_ts(uname), boundary.get(uname), *g, rows);
+            let seen = marked.get(uname).map(Vec::as_slice).unwrap_or(&[]);
+            let (next_ts, next_boundary) = advance(
+                *session_ts,
+                prev_ts(uname),
+                boundary.get(uname),
+                *g,
+                read,
+                rows,
+                seen,
+                truncated,
+                incomplete.contains(uname),
+            );
             new_state.insert(uname.clone(), next_ts);
             if let Some(b) = next_boundary {
                 new_boundary.insert(uname.clone(), b);
@@ -3796,7 +3871,7 @@ pub async fn q_new_messages(
     let unknown_shards = current_unknown_shards(db, names);
 
     if changed.is_empty() {
-        let (new_state, new_boundary) = rebuild(&HashMap::new());
+        let (new_state, new_boundary) = rebuild(&HashMap::new(), &HashMap::new(), &HashSet::new(), false);
         let meta = meta_for_global_query(
             0,
             0,
@@ -3821,18 +3896,25 @@ pub async fn q_new_messages(
     let per_table_limit = limit.saturating_mul(5).max(200);
     // 每条消息带着 (分片:local_id) 走到截断之后，用来算边界；输出前去掉。
     let mut all_msgs: Vec<(Value, String)> = Vec::new();
+    // 建窗口时窗口里已经可见、不返回的行：会话 → (create_time, 分片:local_id)
+    let mut marked: HashMap<String, Vec<(i64, String)>> = HashMap::new();
+    // 有分片没读成的会话：这一轮的已见过不全，不建窗口（u1-r2 F3）
+    let mut incomplete: HashSet<String> = HashSet::new();
     let mut scanned_rel_keys: HashSet<String> = HashSet::new();
     let mut hit_rel_keys: HashSet<String> = HashSet::new();
     let mut cache_modes: HashMap<String, String> = HashMap::new();
     let mut shard_paths: HashMap<String, String> = HashMap::new();
 
-    for uname in changed.iter().copied() {
-        let since_ts = prev_ts(uname).unwrap_or(fallback_ts);
+    for (uname, read) in changed.iter().copied() {
+        let since_ts = read.since();
         let chat_boundary = boundary.get(uname);
-        let on_boundary = applies(prev_ts(uname), chat_boundary);
-        // 用 since 做分片时间路由，跳过冷库；边界生效时游标那一秒的分片也要读
-        let since_for_route = Some(route_since(since_ts, on_boundary));
-        let (shards, _) = find_msg_shards(db, names, uname, since_for_route, None, true).await?;
+        // 用 since 做分片时间路由，跳过冷库；窗口起点之后的分片都要读
+        let since_for_route = Some(read.route_since());
+        let (shards, _, failed) =
+            find_msg_shards_checked(db, names, uname, since_for_route, None, true).await?;
+        if failed > 0 {
+            incomplete.insert(uname.clone());
+        }
         if shards.is_empty() {
             continue;
         }
@@ -3863,19 +3945,18 @@ pub async fn q_new_messages(
             let group_nicknames2 = group_nicknames.clone();
             let tname_for_log = tname.clone();
             let rel_key_for_hit = shard.rel_key.clone();
-            let condition = where_clause(
-                on_boundary,
-                &chat_boundary
-                    .map(|b| b.local_ids_in(&rel))
-                    .unwrap_or_default(),
-            );
+            let condition = where_clause(read, &read.excluded_in(chat_boundary, &rel));
+            // 建窗口那次：再列出窗口里此刻可见的行（只取 id，不设上限，u1-r1 F1）
+            let seed = read.seed_clause().map(|c| (c, read.route_since(), since_ts));
 
             let Some((conn, _)) = db.open_query_conn(&rel).await? else {
                 eprintln!("[new-messages] open failed for {}", rel);
+                incomplete.insert(uname.clone());
                 continue;
             };
 
-            let msgs: Vec<(i64, Value)> = match tokio::task::spawn_blocking(move || {
+            type Seeded = Option<rusqlite::Result<Vec<(i64, i64)>>>;
+            let (msgs, seeded): (Vec<(i64, Value)>, Seeded) = match tokio::task::spawn_blocking(move || {
                 let id2u = load_id2u(&conn);
 
                 let sql = format!(
@@ -3934,17 +4015,29 @@ pub async fn q_new_messages(
                     }
                     result.push((local_id, msg));
                 }
-                Ok::<_, anyhow::Error>(result)
+                // After the main read, so a failing seed never stops it (u1-r3 F5).
+                let seeded = seed.map(|(clause, from, cursor)| {
+                    conn.prepare(&format!("SELECT local_id, create_time FROM [{}] WHERE {}", tname, clause))
+                        .and_then(|mut stmt| {
+                            stmt.query_map(rusqlite::params![from, cursor], |row| {
+                                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                            })
+                            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
+                        })
+                });
+                Ok::<_, anyhow::Error>((result, seeded))
             })
             .await
             {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => {
                     eprintln!("[new-messages] skip {}: {}", tname_for_log, e);
+                    incomplete.insert(uname.clone());
                     continue;
                 }
                 Err(e) => {
                     eprintln!("[new-messages] task error: {}", e);
+                    incomplete.insert(uname.clone());
                     continue;
                 }
             };
@@ -3956,10 +4049,22 @@ pub async fn q_new_messages(
                 msgs.into_iter()
                     .map(|(local_id, msg)| (msg, message_id(&rel, local_id))),
             );
+            match seeded {
+                Some(Ok(rows)) => marked
+                    .entry(uname.clone())
+                    .or_default()
+                    .extend(rows.into_iter().map(|(local_id, ts)| (ts, message_id(&rel, local_id)))),
+                Some(Err(e)) => {
+                    eprintln!("[new-messages] seed skipped {}: {}", rel, e);
+                    incomplete.insert(uname.clone());
+                }
+                None => {}
+            }
         }
     }
 
     all_msgs.sort_by_key(|(m, _)| m["timestamp"].as_i64().unwrap_or(0));
+    let truncated = all_msgs.len() > limit;
     all_msgs.truncate(limit);
 
     // 截断之后实际返回的消息，按会话分组：(timestamp, 分片:local_id)
@@ -3972,7 +4077,7 @@ pub async fn q_new_messages(
                 .push((ts, id.clone()));
         }
     }
-    let (new_state, new_boundary) = rebuild(&returned);
+    let (new_state, new_boundary) = rebuild(&returned, &marked, &incomplete, truncated);
     let all_msgs: Vec<Value> = all_msgs.into_iter().map(|(msg, _)| msg).collect();
 
     let meta = meta_for_global_query(

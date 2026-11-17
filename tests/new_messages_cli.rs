@@ -264,3 +264,62 @@ fn s13_lagging_session_table() {
     assert!(r3.is_empty());
     assert!(r4.is_empty());
 }
+
+// uubot #157 acceptance 2: a message of second T that becomes visible only
+// after the cursor reached T+1 (a file or sticker written late). uubot.4
+// skips it for good; the window returns it on a later round, exactly once.
+#[test]
+fn s157a_late_row_after_the_cursor_passed_it() {
+    let t = now_minus_hour();
+    let mut c = Cli::new("s157a", 1, cursor_at(t - 10));
+    c.fx.post(0, t + 1, BOB, "next-text");
+    let r1 = c.poll();
+    c.fx.insert(0, None, t, ALICE, "late-file");
+    let r2 = c.poll();
+    let r3 = c.poll();
+    c.fx.post(0, t + 5, BOB, "later");
+    let r4 = c.poll();
+    c.finish();
+    assert_eq!(r1, strs(&["next-text"]));
+    assert_eq!(r2, strs(&["late-file"]));
+    assert!(r3.is_empty());
+    assert_eq!(r4, strs(&["later"]));
+}
+
+// #157 p1 F1: a cursor written by an older core has no window. The first
+// round marks what is already visible in the window as seen (nothing old is
+// returned again); a row that becomes visible after that round still comes.
+#[test]
+fn s157b_late_row_after_an_upgrade() {
+    let t = now_minus_hour();
+    let mut c = Cli::new("s157b", 1, cursor_at(t));
+    c.fx.insert(0, None, t - 20, ALICE, "seen-before-upgrade");
+    c.fx.post(0, t, BOT, "returned-by-old-core");
+    let r1 = c.poll();
+    c.fx.insert(0, None, t - 3, ALICE, "late-after-upgrade");
+    let r2 = c.poll();
+    let r3 = c.poll();
+    c.finish();
+    assert!(r1.is_empty());
+    assert_eq!(r2, strs(&["late-after-upgrade"]));
+    assert!(r3.is_empty());
+}
+
+// #157 u1-r1 F1: the window holds more rows than the per-table limit (200
+// here) when it is set up after an upgrade. No old row comes back later.
+#[test]
+fn s157c_busy_window_at_the_upgrade_is_not_replayed() {
+    let t = now_minus_hour();
+    let mut c = Cli::new("s157c", 1, cursor_at(t));
+    let old: Vec<String> = (0..1010).map(|i| format!("old-{:04}", i)).collect();
+    c.fx.insert_many(0, t - 5, ALICE, &old);
+    c.fx.post(0, t, BOT, "returned-by-old-core");
+    let r1 = c.poll();
+    let r2 = c.poll();
+    c.fx.post(0, t + 2, BOB, "after-upgrade");
+    let r3 = c.poll();
+    c.finish();
+    assert!(r1.is_empty(), "replayed {} rows", r1.len());
+    assert!(r2.is_empty(), "replayed {} rows", r2.len());
+    assert_eq!(r3, strs(&["after-upgrade"]));
+}

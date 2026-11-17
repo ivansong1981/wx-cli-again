@@ -152,6 +152,37 @@ impl Fixture {
         conn.last_insert_rowid()
     }
 
+    /// Insert one row whose `create_time` is stored as a REAL, which the
+    /// core cannot read as an integer (uubot #157 u1-r2 F3: a failing read).
+    #[allow(dead_code)]
+    pub fn insert_real_time(&self, shard: usize, ts: f64, sender: i64, text: &str) {
+        Self::tick();
+        let conn = open_encrypted(&self.db_dir.join(shard_key(shard)));
+        let content = format!("{}:\n{}", sender_username(sender), text);
+        conn.execute(
+            &format!(
+                "INSERT INTO [{}](local_type, create_time, real_sender_id,
+                                  message_content, WCDB_CT_message_content)
+                 VALUES (1, ?1, ?2, ?3, 0)",
+                msg_table(GROUP)
+            ),
+            params![ts, sender, content],
+        )
+        .unwrap();
+    }
+
+    /// Delete the rows whose label is `text` (a fault that goes away).
+    #[allow(dead_code)]
+    pub fn delete_text(&self, shard: usize, text: &str) {
+        Self::tick();
+        let conn = open_encrypted(&self.db_dir.join(shard_key(shard)));
+        conn.execute(
+            &format!("DELETE FROM [{}] WHERE message_content LIKE ?1", msg_table(GROUP)),
+            params![format!("%\n{}", text)],
+        )
+        .unwrap();
+    }
+
     /// Insert many same-time messages in one transaction (no per-row tick).
     pub fn insert_many(&self, shard: usize, ts: i64, sender: i64, texts: &[String]) {
         Self::tick();
