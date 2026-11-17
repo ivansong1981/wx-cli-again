@@ -1314,6 +1314,39 @@ async fn find_msg_shards(
     Ok((shards, scanned))
 }
 
+/// What the `sqlite_master` lookup of a shard's chat table says.
+#[derive(Debug, PartialEq, Eq)]
+enum TableCheck {
+    Exists,
+    Absent,
+    /// The lookup itself failed: the table may be there (u1-r3 F6).
+    Failed,
+}
+
+fn table_check(lookup: &rusqlite::Result<i64>) -> TableCheck {
+    match lookup {
+        Ok(_) => TableCheck::Exists,
+        Err(rusqlite::Error::QueryReturnedNoRows) => TableCheck::Absent,
+        Err(_) => TableCheck::Failed,
+    }
+}
+
+#[cfg(test)]
+mod table_check_tests {
+    use super::*;
+
+    // u1-r4 F7: only "no such row" means the table is absent; any other
+    // error is a failed check, which makes the chat's setup incomplete.
+    #[test]
+    fn only_no_rows_means_absent() {
+        assert_eq!(table_check(&Ok(1)), TableCheck::Exists);
+        assert_eq!(table_check(&Err(rusqlite::Error::QueryReturnedNoRows)), TableCheck::Absent);
+        let busy = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(5), Some("database is locked".into()));
+        assert_eq!(table_check(&Err(busy)), TableCheck::Failed);
+        assert_eq!(table_check(&Err(rusqlite::Error::InvalidQuery)), TableCheck::Failed);
+    }
+}
+
 /// `find_msg_shards`, also counting the shards that could not be opened or
 /// checked: their rows are unknown this poll (uubot #157 u1-r3 F6).
 async fn find_msg_shards_checked(
@@ -1376,13 +1409,13 @@ async fn find_msg_shards_checked(
                     [&tname],
                     |row| row.get::<_, i64>(0),
                 );
-                match table_exists {
-                    Ok(_) => {}
-                    Err(rusqlite::Error::QueryReturnedNoRows) => {
+                match table_check(&table_exists) {
+                    TableCheck::Exists => {}
+                    TableCheck::Absent => {
                         return Ok::<_, anyhow::Error>((false, None, None, None, false));
                     }
                     // Not known to be absent: skipped as before, but counted.
-                    Err(_) => return Ok((false, None, None, None, true)),
+                    TableCheck::Failed => return Ok((false, None, None, None, true)),
                 }
                 let max_ts: Option<i64> = conn
                     .query_row(
