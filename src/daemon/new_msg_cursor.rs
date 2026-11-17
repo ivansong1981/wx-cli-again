@@ -112,9 +112,14 @@ pub fn parse_boundary(value: Option<&Value>) -> BoundaryMap {
         return out;
     };
     for (chat, entry) in map {
-        let Ok(boundary) = serde_json::from_value::<Boundary>(entry.clone()) else {
+        // The window is parsed on its own: a broken window must not take the
+        // cursor-second ids with it (u1-r1 F2).
+        let mut entry = entry.clone();
+        let window = entry.as_object_mut().and_then(|o| o.remove("window"));
+        let Ok(boundary) = serde_json::from_value::<Boundary>(entry) else {
             continue;
         };
+        let window = window.and_then(|v| serde_json::from_value::<Window>(v).ok());
         let ids: BTreeSet<String> = boundary.ids.iter().cloned().collect();
         let well_formed = ids.len() == boundary.ids.len()
             && boundary.ids.iter().all(|id| split_id(id).is_some());
@@ -125,7 +130,7 @@ pub fn parse_boundary(value: Option<&Value>) -> BoundaryMap {
             ts: boundary.ts,
             ids: ids.into_iter().collect(),
             left: boundary.left.min(BOUNDARY_RECHECK_POLLS),
-            window: boundary.window,
+            window,
         };
         if !b.window_matches() {
             b.window = None;
@@ -593,15 +598,24 @@ mod tests {
             "win": {"ts": 5, "ids": ["a:2"], "left": 1, "window": {"from": 2, "seen": {"a:1": 3, "a:2": 5}}},
             "win_after_ts": {"ts": 5, "ids": [], "left": 1, "window": {"from": 2, "seen": {"a:1": 6}}},
             "win_ids_differ": {"ts": 5, "ids": [], "left": 1, "window": {"from": 2, "seen": {"a:2": 5}}},
-            "win_bad": {"ts": 5, "ids": [], "left": 1, "window": {"from": "x"}},
+            "win_bad": {"ts": 5, "ids": ["a:2"], "left": 1, "window": {"from": "x"}},
+            "win_seen_bad": {"ts": 5, "ids": ["a:2"], "left": 1, "window": {"from": 2, "seen": {"a:2": "5"}}},
         });
         let parsed = parse_boundary(Some(&v));
-        assert_eq!(parsed.keys().collect::<Vec<_>>(), vec!["ok", "too_many_left", "win", "win_after_ts", "win_ids_differ"]);
+        assert_eq!(
+            parsed.keys().collect::<Vec<_>>(),
+            vec!["ok", "too_many_left", "win", "win_after_ts", "win_bad", "win_ids_differ", "win_seen_bad"]
+        );
         assert_eq!(parsed["ok"].ids, vec!["message/message_0.db:1", "message/message_0.db:2"]);
         assert_eq!(parsed["too_many_left"].left, 120);
         assert!(parsed["win"].window.is_some());
         assert!(parsed["win_after_ts"].window.is_none());
         assert!(parsed["win_ids_differ"].window.is_none());
+        // A broken window alone keeps the cursor-second ids (u1-r1 F2).
+        for k in ["win_bad", "win_seen_bad"] {
+            assert!(parsed[k].window.is_none());
+            assert_eq!(parsed[k].ids, vec!["a:2".to_string()]);
+        }
         assert!(parse_boundary(Some(&serde_json::json!([1]))).is_empty());
         assert!(parse_boundary(None).is_empty());
     }
