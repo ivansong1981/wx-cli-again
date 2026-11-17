@@ -304,3 +304,22 @@ fn s157b_late_row_after_an_upgrade() {
     assert_eq!(r2, strs(&["late-after-upgrade"]));
     assert!(r3.is_empty());
 }
+
+// #157 u1-r1 F1: the window holds more rows than the per-table limit (200
+// here) when it is set up after an upgrade. No old row comes back later.
+#[test]
+fn s157c_busy_window_at_the_upgrade_is_not_replayed() {
+    let t = now_minus_hour();
+    let mut c = Cli::new("s157c", 1, cursor_at(t));
+    let old: Vec<String> = (0..1010).map(|i| format!("old-{:04}", i)).collect();
+    c.fx.insert_many(0, t - 5, ALICE, &old);
+    c.fx.post(0, t, BOT, "returned-by-old-core");
+    let r1 = c.poll();
+    let r2 = c.poll();
+    c.fx.post(0, t + 2, BOB, "after-upgrade");
+    let r3 = c.poll();
+    c.finish();
+    assert!(r1.is_empty(), "replayed {} rows", r1.len());
+    assert!(r2.is_empty(), "replayed {} rows", r2.len());
+    assert_eq!(r3, strs(&["after-upgrade"]));
+}

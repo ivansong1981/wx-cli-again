@@ -17,11 +17,13 @@
 //!
 //! A chat with a cursor but no usable window (a boundary written by
 //! `uubot.3`/`uubot.4`, one that does not parse, or one for another second)
-//! is read once from `cursor - WINDOW_SECONDS`, in the same snapshot: what is
-//! visible before the cursor second is marked seen and not returned; at the
-//! cursor second the old boundary's ids stay seen and the rest is returned
-//! as the old rules would (all of it seen when no old boundary applies, the
-//! strict rule). A message visible before that first read and never returned
+//! is read once by the old rules, and in the same snapshot a second query
+//! without a row limit lists the ids visible from `cursor - WINDOW_SECONDS`
+//! up to the cursor second; they are marked seen, not returned. At the
+//! cursor second only the old boundary's ids are marked (the old rules
+//! return the rest); with no old boundary the whole second is (the strict
+//! rule). The seed read has no limit so a busy window cannot leave rows out
+//! of it (u1-r1 F1). A message visible before that first read and never returned
 //! stays missed (history; out of scope of #157). A chat seen for the first
 //! time keeps the strict rule from the fallback second.
 //!
@@ -182,8 +184,8 @@ pub fn gate(session_ts: i64, prev_ts: Option<i64>, fallback_ts: i64, boundary: O
 pub enum Read {
     /// First sight: `create_time > after` (the fallback second).
     Strict { after: i64 },
-    /// No usable window: read from `from = cursor - WINDOW_SECONDS` and mark
-    /// what is already there as seen (`returnable` decides per row).
+    /// No usable window: read by the old rules from `cursor`, and seed the
+    /// window from `from = cursor - WINDOW_SECONDS` (`seed_clause`).
     Init { from: i64, cursor: i64, old_ids: Option<BTreeSet<String>> },
     /// Window in force: `create_time >= from` minus the seen messages.
     Window { from: i64 },
@@ -208,7 +210,8 @@ impl Read {
     pub fn since(&self) -> i64 {
         match self {
             Read::Strict { after } => *after,
-            Read::Init { from, .. } | Read::Window { from } => *from,
+            Read::Init { cursor, .. } => *cursor,
+            Read::Window { from } => *from,
         }
     }
 
@@ -224,19 +227,18 @@ impl Read {
     pub fn excluded_in(&self, boundary: Option<&Boundary>, rel_key: &str) -> Vec<i64> {
         match (self, boundary.and_then(|b| b.window.as_ref())) {
             (Read::Window { .. }, Some(w)) => local_ids_of(w.seen.keys(), rel_key),
+            (Read::Init { old_ids: Some(ids), .. }, _) => local_ids_of(ids.iter(), rel_key),
             _ => Vec::new(),
         }
     }
 
-    /// Whether a row read this poll is returned (otherwise it is only marked
-    /// seen while the window is set up).
-    pub fn returnable(&self, create_time: i64, id: &str) -> bool {
+    /// The seed query of an `Init` read: `?1` is `from`, `?2` the cursor
+    /// second; no row limit. `None` for the other reads.
+    pub fn seed_clause(&self) -> Option<&'static str> {
         match self {
-            Read::Init { cursor, old_ids, .. } => {
-                create_time > *cursor
-                    || (create_time == *cursor && old_ids.as_ref().is_some_and(|ids| !ids.contains(id)))
-            }
-            _ => true,
+            Read::Init { old_ids: Some(_), .. } => Some("create_time >= ?1 AND create_time < ?2"),
+            Read::Init { old_ids: None, .. } => Some("create_time >= ?1 AND create_time <= ?2"),
+            _ => None,
         }
     }
 }
@@ -246,8 +248,13 @@ impl Read {
 /// take up the per-table limit.
 pub fn where_clause(read: &Read, excluded_local_ids: &[i64]) -> String {
     match read {
-        Read::Strict { .. } => "create_time > ?1".to_string(),
-        Read::Init { .. } => "create_time >= ?1".to_string(),
+        // The old rules (uubot.4): the cursor second minus the old ids.
+        Read::Strict { .. } | Read::Init { old_ids: None, .. } => "create_time > ?1".to_string(),
+        Read::Init { .. } if excluded_local_ids.is_empty() => "create_time >= ?1".to_string(),
+        Read::Init { .. } => {
+            let list: Vec<String> = excluded_local_ids.iter().map(i64::to_string).collect();
+            format!("(create_time > ?1 OR (create_time = ?1 AND local_id NOT IN ({})))", list.join(","))
+        }
         Read::Window { .. } if excluded_local_ids.is_empty() => "create_time >= ?1".to_string(),
         Read::Window { .. } => {
             let list: Vec<String> = excluded_local_ids.iter().map(i64::to_string).collect();
@@ -258,8 +265,8 @@ pub fn where_clause(read: &Read, excluded_local_ids: &[i64]) -> String {
 
 /// Next cursor second and boundary for one chat present in `SessionTable`.
 /// `returned` holds `(create_time, message_id)` of this chat's messages that
-/// survived the global limit; `marked` the rows only marked seen by an
-/// `Init` read; `truncated` whether the global limit cut this poll.
+/// survived the global limit; `marked` the ids of an `Init` read's seed
+/// query; `truncated` whether the global limit cut this poll.
 pub fn advance(
     session_ts: i64,
     prev_ts: Option<i64>,
@@ -345,6 +352,18 @@ mod tests {
         prev: Option<&Boundary>,
         limit: usize,
     ) -> (Vec<(i64, String)>, i64, Option<Boundary>) {
+        poll_with(visible, session_ts, prev_ts, prev, limit, 1000)
+    }
+
+    /// `poll` with the per-table limit of the main shard query set too.
+    fn poll_with(
+        visible: &[(i64, &str)],
+        session_ts: i64,
+        prev_ts: Option<i64>,
+        prev: Option<&Boundary>,
+        limit: usize,
+        per_table: usize,
+    ) -> (Vec<(i64, String)>, i64, Option<Boundary>) {
         let g = gate(session_ts, prev_ts, 0, prev);
         let read = plan(prev_ts, 0, prev);
         if g == Gate::Skip {
@@ -353,19 +372,31 @@ mod tests {
         }
         let excluded = read.excluded_in(prev, "m");
         let since = read.since();
-        let mut rows: Vec<(i64, String)> = visible
+        let clause = where_clause(&read, &excluded);
+        let mut out: Vec<(i64, String)> = visible
             .iter()
             .filter(|(t, id)| {
                 let local: i64 = id.rsplit_once(':').unwrap().1.parse().unwrap();
-                match where_clause(&read, &excluded).as_str() {
-                    "create_time > ?1" => *t > since,
-                    _ => *t >= since && !excluded.contains(&local),
+                if clause == "create_time > ?1" {
+                    *t > since
+                } else if clause.starts_with("(create_time > ?1 OR") {
+                    *t > since || (*t == since && !excluded.contains(&local))
+                } else {
+                    *t >= since && !excluded.contains(&local)
                 }
             })
             .map(|(t, id)| (*t, id.to_string()))
             .collect();
-        rows.sort();
-        let (mut out, marked): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(t, id)| read.returnable(*t, id));
+        out.sort();
+        out.truncate(per_table);
+        let marked: Vec<(i64, String)> = match (&read, read.seed_clause()) {
+            (Read::Init { from, cursor, .. }, Some(seed)) => visible
+                .iter()
+                .filter(|(t, _)| *t >= *from && if seed.ends_with("< ?2") { *t < *cursor } else { *t <= *cursor })
+                .map(|(t, id)| (*t, id.to_string()))
+                .collect(),
+            _ => Vec::new(),
+        };
         let truncated = out.len() > limit;
         out.truncate(limit);
         let (ts, nb) = advance(session_ts, prev_ts, prev, g, &read, &out, &marked, truncated);
@@ -415,9 +446,15 @@ mod tests {
         let i = Read::Init { from: 70, cursor: 100, old_ids: None };
         assert_eq!((s.route_since(), s.since()), (101, 100));
         assert_eq!((w.route_since(), w.since()), (70, 70));
-        assert_eq!((i.route_since(), i.since()), (70, 70));
+        assert_eq!((i.route_since(), i.since()), (70, 100));
         assert_eq!(where_clause(&s, &[1]), "create_time > ?1");
-        assert_eq!(where_clause(&i, &[1]), "create_time >= ?1");
+        assert_eq!(where_clause(&i, &[1]), "create_time > ?1");
+        let io = Read::Init { from: 70, cursor: 100, old_ids: Some(BTreeSet::new()) };
+        assert_eq!(where_clause(&io, &[]), "create_time >= ?1");
+        assert_eq!(where_clause(&io, &[3]), "(create_time > ?1 OR (create_time = ?1 AND local_id NOT IN (3)))");
+        assert_eq!(i.seed_clause(), Some("create_time >= ?1 AND create_time <= ?2"));
+        assert_eq!(io.seed_clause(), Some("create_time >= ?1 AND create_time < ?2"));
+        assert_eq!(w.seed_clause(), None);
         assert_eq!(where_clause(&w, &[]), "create_time >= ?1");
         assert_eq!(where_clause(&w, &[3, 7]), "(create_time >= ?1 AND local_id NOT IN (3,7))");
     }
@@ -428,6 +465,8 @@ mod tests {
         assert_eq!(Read::Window { from: 1 }.excluded_in(Some(&bd), "message/message_0.db"), vec![7, 9]);
         assert_eq!(Read::Window { from: 1 }.excluded_in(Some(&bd), "message/message_1.db"), vec![7]);
         assert!(Read::Init { from: 1, cursor: 9, old_ids: None }.excluded_in(Some(&bd), "message/message_0.db").is_empty());
+        let old: BTreeSet<String> = ["message/message_0.db:4".to_string(), "message/message_1.db:5".to_string()].into_iter().collect();
+        assert_eq!(Read::Init { from: 1, cursor: 9, old_ids: Some(old) }.excluded_in(None, "message/message_0.db"), vec![4]);
     }
 
     // #157 acceptance 2: the message of second T becomes visible only after
@@ -514,6 +553,26 @@ mod tests {
         let visible = [(990, "m:1"), (1000, "m:2"), (997, "m:3"), (1004, "m:4")];
         let (out, _, _) = poll(&visible, 1004, Some(1000), Some(&nb), 200);
         assert_eq!(out, ret(&[(997, "m:3"), (1004, "m:4")]));
+    }
+
+    // u1-r1 F1: a window busier than the per-table limit. The main read keeps
+    // the old rules, so it is not filled by old rows; the seed read has no
+    // limit, so no old row is left out of the window and returned later.
+    #[test]
+    fn a_busy_window_neither_replays_nor_blocks() {
+        let ids: Vec<String> = (0..8).map(|i| format!("m:{}", i)).collect();
+        let mut visible: Vec<(i64, &str)> = (0..5).map(|i| (990 + i as i64, ids[i].as_str())).collect();
+        visible.push((1000, ids[5].as_str()));
+        visible.push((1000, ids[6].as_str()));
+        visible.push((1001, ids[7].as_str()));
+        let old = b(1000, &["m:5"], 0);
+        let (out, ts, nb) = poll_with(&visible, 1001, Some(1000), Some(&old), 200, 3);
+        assert_eq!(out, ret(&[(1000, "m:6"), (1001, "m:7")]));
+        assert_eq!(ts, 1001);
+        let nb = nb.unwrap();
+        assert_eq!(nb.window.as_ref().unwrap().seen.len(), 8);
+        let (out, _, _) = poll_with(&visible, 1001, Some(1001), Some(&nb), 200, 3);
+        assert!(out.is_empty());
     }
 
     #[test]

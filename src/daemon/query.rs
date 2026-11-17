@@ -3879,14 +3879,27 @@ pub async fn q_new_messages(
             let tname_for_log = tname.clone();
             let rel_key_for_hit = shard.rel_key.clone();
             let condition = where_clause(read, &read.excluded_in(chat_boundary, &rel));
+            // 建窗口那次：再列出窗口里此刻可见的行（只取 id，不设上限，u1-r1 F1）
+            let seed = read.seed_clause().map(|c| (c, read.route_since(), since_ts));
 
             let Some((conn, _)) = db.open_query_conn(&rel).await? else {
                 eprintln!("[new-messages] open failed for {}", rel);
                 continue;
             };
 
-            let msgs: Vec<(i64, Value)> = match tokio::task::spawn_blocking(move || {
+            let (msgs, seeded): (Vec<(i64, Value)>, Vec<(i64, i64)>) = match tokio::task::spawn_blocking(move || {
                 let id2u = load_id2u(&conn);
+                let seeded: Vec<(i64, i64)> = match seed {
+                    Some((clause, from, cursor)) => conn
+                        .prepare(&format!("SELECT local_id, create_time FROM [{}] WHERE {}", tname, clause))
+                        .and_then(|mut stmt| {
+                            stmt.query_map(rusqlite::params![from, cursor], |row| {
+                                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                            })
+                            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>())
+                        })?,
+                    None => Vec::new(),
+                };
 
                 let sql = format!(
                     "SELECT local_id, local_type, create_time, real_sender_id,
@@ -3944,7 +3957,7 @@ pub async fn q_new_messages(
                     }
                     result.push((local_id, msg));
                 }
-                Ok::<_, anyhow::Error>(result)
+                Ok::<_, anyhow::Error>((result, seeded))
             })
             .await
             {
@@ -3962,15 +3975,14 @@ pub async fn q_new_messages(
             if !msgs.is_empty() {
                 hit_rel_keys.insert(rel_key_for_hit);
             }
-            for (local_id, msg) in msgs {
-                let id = message_id(&rel, local_id);
-                let ts = msg["timestamp"].as_i64().unwrap_or(0);
-                if read.returnable(ts, &id) {
-                    all_msgs.push((msg, id));
-                } else {
-                    marked.entry(uname.clone()).or_default().push((ts, id));
-                }
-            }
+            all_msgs.extend(
+                msgs.into_iter()
+                    .map(|(local_id, msg)| (msg, message_id(&rel, local_id))),
+            );
+            marked
+                .entry(uname.clone())
+                .or_default()
+                .extend(seeded.into_iter().map(|(local_id, ts)| (ts, message_id(&rel, local_id))));
         }
     }
 
